@@ -1,5 +1,10 @@
 *.o
 build/
+patient_records.dat
+logs/*.txt
+*.o
+/tmp/triage_fifo
+/tmp/discharge_fifo
 logs/*.txt
 *.dat
 core dumps
