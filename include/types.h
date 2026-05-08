@@ -19,6 +19,18 @@ typedef struct {
     time_t arrival_time;
 } PatientRecord;
 
+#define MAX_EVENT_LOG 200
+
+typedef struct {
+    int    patient_id;
+    int    priority;         /* triage level 1-5 (1 = most urgent) */
+    time_t arrival_time;     /* epoch seconds when patient arrived  */
+    time_t start_time;       /* epoch seconds when admitted to bed  */
+    long   wait_time;        /* start_time - arrival_time           */
+    long   service_time;     /* estimated treatment duration (s)    */
+    long   turnaround_time;  /* wait_time + service_time            */
+} ScheduleEvent;
+
 typedef struct {
     int partition_id;
     int start_unit;

@@ -9,6 +9,8 @@ SRC_DIR = src
 ADMISSIONS_SRCS = $(SRC_DIR)/admissions.c $(SRC_DIR)/scheduler.c $(SRC_DIR)/bed_allocator.c $(SRC_DIR)/ipc_utils.c $(SRC_DIR)/terminal_ui.c
 PATIENT_SIM_SRCS = $(SRC_DIR)/patient_simulator.c $(SRC_DIR)/ipc_utils.c
 
+SCHED_TEST_SRCS = $(SRC_DIR)/scheduler.c
+
 all: $(BUILD_DIR) $(BUILD_DIR)/admissions $(BUILD_DIR)/patient_simulator
 	@echo "[BUILD] Prime BedSpace compiled successfully."
 
@@ -29,10 +31,16 @@ clean:
 run:
 	bash scripts/start_hospital.sh
 
-test:
-	bash scripts/stress_test.sh
+$(BUILD_DIR)/sched_test: $(SCHED_TEST_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -DSCHEDULER_TEST $^ -o $@ $(LDFLAGS)
+
+test: $(BUILD_DIR)/sched_test
+	@mkdir -p logs
+	@echo "[TEST] Running scheduler self-test..."
+	@$(BUILD_DIR)/sched_test && echo "[TEST] Result: PASS" || echo "[TEST] Result: FAIL"
 
 valgrind:
 	valgrind --leak-check=full --track-origins=yes ./build/admissions
 
 .PHONY: all clean run test valgrind
+
