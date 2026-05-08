@@ -1,0 +1,154 @@
+/**
+ * ==============================================================================
+ * Project: Prime BedSpace
+ * File: admissions.c
+ * Group: <Group XX>
+ * Members: <Member 1>, <Member 2>
+ * Date: 2026-05-08
+ * Purpose: Main admissions manager using fork/exec and IPC FIFOs.
+ * Compile: gcc -Wall -Wextra -pthread src/admissions.c src/scheduler.c src/bed_allocator.c src/ipc_utils.c src/terminal_ui.c -o build/admissions -lrt
+ * Usage: ./build/admissions
+ * ==============================================================================
+ */
+
+#include "types.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <time.h>
+
+pid_t child_pids[50];
+int child_count = 0;
+BedPartition ward[MAX_BEDS];
+volatile sig_atomic_t running = 1;
+
+void sigchld_handler(int sig) {
+    (void)sig;
+    pid_t pid;
+    int status;
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        for (int i = 0; i < child_count; i++) {
+            if (child_pids[i] == pid) {
+                for (int j = i; j < child_count - 1; j++) {
+                    child_pids[j] = child_pids[j + 1];
+                }
+                child_count--;
+                break;
+            }
+        }
+    }
+}
+
+void sigterm_handler(int sig) {
+    (void)sig;
+    running = 0;
+}
+
+void admit_patient(PatientRecord *p, int bed_id) {
+    if (child_count >= 50) {
+        fprintf(stderr, "[ADMISSIONS] Queue full.\n");
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork failed");
+        return;
+    }
+
+    if (pid == 0) {
+        char patient_id_str[32];
+        char triage_str[32];
+        char bed_id_str[32];
+
+        snprintf(patient_id_str, sizeof(patient_id_str), "%d", p->patient_id);
+        snprintf(triage_str, sizeof(triage_str), "%d", p->priority);
+        snprintf(bed_id_str, sizeof(bed_id_str), "%d", bed_id);
+
+        char *argv[] = {
+            "./build/patient_simulator",
+            patient_id_str,
+            triage_str,
+            bed_id_str,
+            ward[bed_id].bed_type,
+            NULL
+        };
+
+        execv("./build/patient_simulator", argv);
+        perror("execv failed");
+        exit(1);
+    } else {
+        child_pids[child_count++] = pid;
+        ward[bed_id].is_free = 0;
+        ward[bed_id].patient_id = p->patient_id;
+        printf("[ADMISSIONS] Patient %d admitted to %s bed %d\n", p->patient_id, ward[bed_id].bed_type, bed_id);
+    }
+}
+
+int main(void) {
+    for (int i = 0; i < MAX_BEDS; i++) {
+        ward[i].partition_id = i;
+        ward[i].is_free = 1;
+        ward[i].patient_id = -1;
+
+        if (i < 4) {
+            strcpy(ward[i].bed_type, "ICU");
+            ward[i].size = 3;
+            ward[i].start_unit = i * 3;
+        } else if (i < 8) {
+            strcpy(ward[i].bed_type, "ISOLATION");
+            ward[i].size = 2;
+            ward[i].start_unit = 12 + (i - 4) * 2;
+        } else {
+            strcpy(ward[i].bed_type, "GENERAL");
+            ward[i].size = 1;
+            ward[i].start_unit = 20 + (i - 8);
+        }
+    }
+
+    struct sigaction sa_chld;
+    memset(&sa_chld, 0, sizeof(sa_chld));
+    sa_chld.sa_handler = sigchld_handler;
+    sa_chld.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    sigaction(SIGCHLD, &sa_chld, NULL);
+
+    struct sigaction sa_term;
+    memset(&sa_term, 0, sizeof(sa_term));
+    sa_term.sa_handler = sigterm_handler;
+    sigaction(SIGTERM, &sa_term, NULL);
+
+    int fd = open("/tmp/discharge_fifo", O_RDONLY | O_NONBLOCK);
+
+    while (running == 1) {
+        if (fd != -1) {
+            char buf[64];
+            ssize_t bytes_read = read(fd, buf, sizeof(buf) - 1);
+            if (bytes_read > 0) {
+                buf[bytes_read] = '\0';
+                int discharged_id = atoi(buf);
+                for (int i = 0; i < MAX_BEDS; i++) {
+                    if (!ward[i].is_free && ward[i].patient_id == discharged_id) {
+                        ward[i].is_free = 1;
+                        ward[i].patient_id = -1;
+                        printf("[ADMISSIONS] Bed freed for patient %d\n", discharged_id);
+                        break;
+                    }
+                }
+            }
+        } else {
+            fd = open("/tmp/discharge_fifo", O_RDONLY | O_NONBLOCK);
+        }
+
+        sleep(1);
+    }
+
+    if (fd != -1) {
+        close(fd);
+    }
+    printf("[ADMISSIONS] Shutting down.\n");
+    return 0;
+}
