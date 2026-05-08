@@ -23,7 +23,7 @@ Prime BedSpace is a C-based hospital admission and bed allocation simulator. It 
 ## Installation
 
 ```bash
-git clone https://github.com/<username>/prime-bedspace.git
+git clone https://github.com/Abdu1-Ahd/prime-bedspace.git
 cd prime-bedspace
 make all
 ```
