@@ -109,7 +109,6 @@ int ba_alloc(BedAllocator *a, int care_units, const char *bed_type,
                     /* First-Fit: take the very first match */
                     chosen      = cur;
                     chosen_prev = prev;
-                    chosen_delta = delta;
                     goto found;
 
                 case STRATEGY_BEST:
@@ -117,7 +116,6 @@ int ba_alloc(BedAllocator *a, int care_units, const char *bed_type,
                         best_delta   = delta;
                         chosen       = cur;
                         chosen_prev  = prev;
-                        chosen_delta = delta;
                     }
                     break;
 
@@ -126,7 +124,6 @@ int ba_alloc(BedAllocator *a, int care_units, const char *bed_type,
                         worst_delta  = delta;
                         chosen       = cur;
                         chosen_prev  = prev;
-                        chosen_delta = delta;
                     }
                     break;
             }
