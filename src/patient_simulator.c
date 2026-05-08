@@ -2,8 +2,8 @@
  * ==============================================================================
  * Project: Prime BedSpace
  * File: patient_simulator.c
- * Group: <Group XX>
- * Members: <Member 1>, <Member 2>
+ * Group: Zawiar & Subhani
+ * Members: Abdul Ahad Zawiar (Abdu1-Ahd), AbdulRahim Subhani (abdulrahim-subh)
  * Date: 2026-05-08
  * Purpose: Simulates a patient treatment lifecycle including random sleep and 
  *          FIFO IPC messaging upon discharge.
@@ -13,6 +13,7 @@
  */
 
 #include "types.h"
+#include "ipc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -66,7 +67,7 @@ int main(int argc, char *argv[]) {
     printf("[PATIENT %d] Treatment complete. Discharging from bed %d.\n", patient_id, bed_id);
 
     // Step 4 - Write patient_id as a string to named FIFO /tmp/discharge_fifo
-    int fd = open("/tmp/discharge_fifo", O_WRONLY | O_NONBLOCK);
+    int fd = open_discharge_fifo_write();
     if (fd != -1) {
         char pid_str[32];
         snprintf(pid_str, sizeof(pid_str), "%d", patient_id);
