@@ -5,33 +5,35 @@
  * Group: Zawiar & Subhani
  * Members: Abdul Ahad Zawiar (Abdu1-Ahd), AbdulRahim Subhani (abdulrahim-subh)
  * Date: 2026-05-08
- * Purpose: Phase 3 — Multi-threaded hospital admissions manager.
+ * Purpose: Phase 3+4 — Multi-threaded hospital admissions manager.
  *          Thread architecture:
- *            - Receptionist Thread: reads triage FIFO → pushes PatientRecord
- *              onto priority queue, signals patient_available condvar.
+ *            - Receptionist Thread: reads triage FIFO (blocking) → pushes
+ *              PatientRecord onto priority queue, signals patient_available.
  *              Blocked by sem_queue (bounded, MAX_WAIT_QUEUE=20) when full.
- *            - Scheduler Thread: waits on patient_available → Best-Fit bed
- *              search under bed_mutex → waits on bed_freed if no bed free →
- *              acquires sem_icu/sem_isolation → do_admit_to_bed().
+ *            - Scheduler Thread: waits on patient_available → ba_alloc() under
+ *              bed_mutex → waits on bed_freed if no bed free → fork/exec.
  *            - Nurse Thread Pool (3 threads, one per bed type):
- *              reads discharge FIFO → frees bed + coalescing → sem_post →
- *              broadcasts bed_freed condvar.
- * Compile: gcc -Wall -Wextra -pthread src/admissions.c src/scheduler.c
- *          src/bed_allocator.c src/ipc_utils.c src/terminal_ui.c
- *          -o build/admissions -Iinclude -lrt -lpthread
- * Usage: ./build/admissions
+ *              reads discharge FIFO (shared fd + discharge_mutex) → ba_free()
+ *              → sem_post → broadcast bed_freed.
+ * Phase 4 adds: BedAllocator (best/first/worst), paging simulation,
+ *              mmap patient record log, ANSI terminal UI.
+ * Compile: make all
+ * Usage: ./build/admissions [--strategy best|first|worst]
  * ==============================================================================
  */
 
 #include "types.h"
 #include "ipc.h"
 #include "scheduler.h"
+#include "bed_allocator.h"
+#include "terminal_ui.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
 #include <fcntl.h>
 #include <time.h>
 #include <pthread.h>
@@ -45,8 +47,9 @@ static pthread_mutex_t bed_mutex   = PTHREAD_MUTEX_INITIALIZER;
 /* Broadcast by nurse threads when a bed is freed */
 static pthread_cond_t  bed_freed   = PTHREAD_COND_INITIALIZER;
 
-/* Protects g_wait_queue (PriorityQueue) */
-static pthread_mutex_t queue_mutex       = PTHREAD_MUTEX_INITIALIZER;
+/* Protects g_wait_queue (PriorityQueue).
+ * NOTE: NOT static — terminal_ui.c links to this symbol for queue depth. */
+pthread_mutex_t queue_mutex       = PTHREAD_MUTEX_INITIALIZER;
 /* Signalled by receptionist when a patient is pushed onto the queue */
 static pthread_cond_t  patient_available = PTHREAD_COND_INITIALIZER;
 
@@ -59,7 +62,7 @@ static sem_t sem_queue;      /* max MAX_WAIT_QUEUE = 20    */
 
 /* ── Globals ─────────────────────────────────────────────────────────── */
 
-static PriorityQueue g_wait_queue;
+PriorityQueue g_wait_queue;   /* NOT static — linked by terminal_ui.c */
 static BedPartition *shm_ward   = NULL;
 static volatile sig_atomic_t running = 1;
 
@@ -88,6 +91,18 @@ static int g_discharge_fd = -1;
 #define LOST_IDS_MAX 3
 static int  lost_ids[LOST_IDS_MAX];
 static int  lost_ids_count = 0;
+
+/* ── Phase 4 globals ─────────────────────────────────────────────────── */
+
+/* Bed allocator — wraps shm_ward[] with free-list + strategy selection */
+static BedAllocator g_allocator;
+
+/* mmap patient record log (MAX_PATIENTS slots, msync'd on shutdown) */
+static PatientRecord *mmap_records = NULL;
+static pthread_mutex_t mmap_mutex  = PTHREAD_MUTEX_INITIALIZER;
+
+/* Active strategy name (set from --strategy argv, displayed in terminal UI) */
+static const char *g_strategy_name = "best";
 
 /* ── Signal handlers ─────────────────────────────────────────────────── */
 
@@ -119,21 +134,12 @@ static void sigterm_handler(int sig) {
 
 /* ── Internal helpers ────────────────────────────────────────────────── */
 
-/* Best-Fit: smallest free bed whose size >= care_units.
-   MUST be called with bed_mutex held. */
-static int find_best_fit_bed(int care_units) {
-    int best = -1;
-    int best_size = MAX_BEDS * 3 + 1; /* larger than any possible size */
-
-    for (int i = 0; i < MAX_BEDS; i++) {
-        if (shm_ward[i].is_free && shm_ward[i].size >= care_units) {
-            if (shm_ward[i].size < best_size) {
-                best      = i;
-                best_size = shm_ward[i].size;
-            }
-        }
-    }
-    return best;
+/* Determine bed_type string from care_units.
+ * Matches the same logic used during ward initialisation. */
+static const char *bed_type_for(int care_units) {
+    if (care_units >= 3) return "ICU";
+    if (care_units == 2) return "ISOLATION";
+    return "GENERAL";
 }
 
 /* Fork and exec patient_simulator for patient p in bed_id.
@@ -357,34 +363,40 @@ static void *thread_scheduler(void *arg) {
         }
         /* GENERAL patients have no capacity semaphore (12 beds, rarely saturated) */
 
-        /* Find best-fit bed under bed_mutex */
+        /* ── ba_alloc() under bed_mutex (replaces inline Best-Fit) ──── */
         pthread_mutex_lock(&bed_mutex);
 
-        int bed_id = find_best_fit_bed(p.care_units);
+        const char *req_type = bed_type_for(p.care_units);
+        int bed_id = ba_alloc(&g_allocator, p.care_units, req_type, p.patient_id);
 
         /* If no bed available, wait for a nurse to broadcast bed_freed */
         while (bed_id == -1 && running) {
             printf("[SCHEDULER] No bed for patient %d — waiting on bed_freed.\n",
                    p.patient_id);
             pthread_cond_wait(&bed_freed, &bed_mutex);
-            bed_id = find_best_fit_bed(p.care_units);
+            bed_id = ba_alloc(&g_allocator, p.care_units, req_type, p.patient_id);
         }
 
         if (!running) {
             pthread_mutex_unlock(&bed_mutex);
-            /* Return semaphore since we never admitted */
             if (p.care_units >= 3)      sem_post(&sem_icu);
             else if (p.care_units == 2) sem_post(&sem_isolation);
             break;
         }
 
-        /* Mark bed OCCUPIED while still holding bed_mutex, then unlock.
-         * do_admit_to_bed() is called with NO mutex held so fork() is safe. */
-        shm_ward[bed_id].is_free    = 0;
+        /* ba_alloc() already set is_free=0. Set patient_id then unlock. */
         shm_ward[bed_id].patient_id = p.patient_id;
         pthread_mutex_unlock(&bed_mutex);
 
-        do_admit_to_bed(&p, bed_id); /* fork() happens here, no mutex held */
+        /* ── mmap record write (Task 5) ──────────────────────────────── */
+        if (mmap_records) {
+            int slot = p.patient_id % MAX_PATIENTS;
+            pthread_mutex_lock(&mmap_mutex);
+            mmap_records[slot] = p;
+            pthread_mutex_unlock(&mmap_mutex);
+        }
+
+        do_admit_to_bed(&p, bed_id); /* fork() — no mutex held */
     }
 
     printf("[SCHEDULER] Thread exiting.\n");
@@ -489,7 +501,7 @@ static void *thread_nurse(void *arg) {
             continue;
         }
 
-        /* ── Step 3: free the bed (bed_mutex, lock order: discharge→bed ── */
+        /* ── Step 3: free the bed via ba_free() (lock order: discharge→bed) */
         pthread_mutex_lock(&bed_mutex);
 
         int freed_bed = -1;
@@ -506,35 +518,21 @@ static void *thread_nurse(void *arg) {
             continue;
         }
 
-        shm_ward[freed_bed].is_free    = 1;
-        shm_ward[freed_bed].patient_id = -1;
+        printf("[%s] Discharging patient %d from bed %d.\n",
+               label, discharged_id, freed_bed);
 
-        /* ── Left+Right coalescing ──────────────────────────────────── */
-        int coalesced = 0;
-        if (freed_bed > range_start &&
-            shm_ward[freed_bed - 1].is_free &&
-            strcmp(shm_ward[freed_bed - 1].bed_type,
-                   shm_ward[freed_bed].bed_type) == 0) {
-            shm_ward[freed_bed - 1].size += shm_ward[freed_bed].size;
-            shm_ward[freed_bed].size = 0;
-            coalesced = 1;
-        }
-        if (freed_bed < range_end &&
-            shm_ward[freed_bed + 1].is_free &&
-            strcmp(shm_ward[freed_bed + 1].bed_type,
-                   shm_ward[freed_bed].bed_type) == 0) {
-            int merge_target = coalesced ? freed_bed - 1 : freed_bed;
-            shm_ward[merge_target].size += shm_ward[freed_bed + 1].size;
-            shm_ward[freed_bed + 1].size = 0;
-            coalesced = 1;
+        /* ba_free() handles is_free=1, coalescing, ward map, frag report */
+        ba_free(&g_allocator, freed_bed);
+
+        /* ── mmap discharge timestamp update (Task 5) ─────────────── */
+        if (mmap_records) {
+            int slot = discharged_id % MAX_PATIENTS;
+            pthread_mutex_lock(&mmap_mutex);
+            mmap_records[slot].arrival_time = time(NULL); /* discharge ts proxy */
+            pthread_mutex_unlock(&mmap_mutex);
         }
 
-        printf("[%s] Bed %d freed (patient %d discharged). "
-               "Coalesced: %s. Broadcasting bed_freed.\n",
-               label, freed_bed, discharged_id,
-               coalesced ? "yes" : "no");
-
-        if (type == NURSE_ICU)        sem_post(&sem_icu);
+        if (type == NURSE_ICU)            sem_post(&sem_icu);
         else if (type == NURSE_ISOLATION) sem_post(&sem_isolation);
 
         pthread_cond_broadcast(&bed_freed);
@@ -547,7 +545,29 @@ static void *thread_nurse(void *arg) {
 
 /* ── main ────────────────────────────────────────────────────────────── */
 
-int main(void) {
+int main(int argc, char *argv[]) {
+    /* ── Parse --strategy best|first|worst ───────────────────────────── */
+    AllocStrategy chosen_strategy = STRATEGY_BEST;
+    for (int i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], "--strategy") == 0) {
+            if      (strcmp(argv[i + 1], "first") == 0) {
+                chosen_strategy = STRATEGY_FIRST;
+                g_strategy_name = "first";
+            } else if (strcmp(argv[i + 1], "worst") == 0) {
+                chosen_strategy = STRATEGY_WORST;
+                g_strategy_name = "worst";
+            } else if (strcmp(argv[i + 1], "best") == 0) {
+                chosen_strategy = STRATEGY_BEST;
+                g_strategy_name = "best";
+            } else {
+                fprintf(stderr, "[ADMISSIONS] Unknown strategy '%s' — using 'best'.\n",
+                        argv[i + 1]);
+            }
+            break;
+        }
+    }
+    printf("[ADMISSIONS] Strategy: %s\n", g_strategy_name);
+
     /* ── Shared memory ──────────────────────────────────────────────── */
     shm_ward = (BedPartition *)init_shared_memory();
     if (shm_ward == NULL) {
@@ -575,6 +595,34 @@ int main(void) {
         }
     }
     printf("[ADMISSIONS] Ward initialized: 4 ICU | 4 ISOLATION | 12 GENERAL\n");
+
+    /* ── BedAllocator init (Phase 4) ─────────────────────────────────── */
+    ba_init(&g_allocator, shm_ward, MAX_BEDS, chosen_strategy);
+
+    /* ── mmap patient record log (Phase 4, Task 5) ───────────────────── */
+    {
+        int pr_fd = open("patient_records.dat", O_RDWR | O_CREAT, 0644);
+        if (pr_fd == -1) {
+            perror("[ADMISSIONS] open patient_records.dat");
+        } else {
+            size_t pr_size = MAX_PATIENTS * sizeof(PatientRecord);
+            if (ftruncate(pr_fd, (off_t)pr_size) == -1) {
+                perror("[ADMISSIONS] ftruncate patient_records.dat");
+            } else {
+                void *ptr = mmap(NULL, pr_size,
+                                 PROT_READ | PROT_WRITE, MAP_SHARED,
+                                 pr_fd, 0);
+                if (ptr == MAP_FAILED) {
+                    perror("[ADMISSIONS] mmap patient_records.dat");
+                } else {
+                    mmap_records = (PatientRecord *)ptr;
+                    printf("[ADMISSIONS] patient_records.dat mmap'd (%zu bytes).\n",
+                           pr_size);
+                }
+            }
+            close(pr_fd);
+        }
+    }
 
     /* ── Semaphores ──────────────────────────────────────────────────── */
     if (sem_init(&sem_icu,       0, ICU_CAPACITY)   != 0 ||
@@ -619,12 +667,18 @@ int main(void) {
 
     printf("[ADMISSIONS] 5 threads launched (1 receptionist, 1 scheduler, 3 nurses).\n");
 
+    /* ── Terminal UI (Phase 4, Task 6) ─────────────────────────── */
+    ui_start(shm_ward, MAX_BEDS, g_strategy_name);
+
     /* ── Main thread: wait for SIGTERM ──────────────────────────────── */
     while (running) {
         pause(); /* sleep until any signal */
     }
 
     printf("[ADMISSIONS] Shutdown signal received. Joining threads...\n");
+
+    /* Stop terminal UI before joining threads */
+    ui_stop();
 
     /* Wake threads that may be blocked in condvar waits */
     pthread_mutex_lock(&queue_mutex);
@@ -655,8 +709,18 @@ int main(void) {
     pthread_cond_destroy(&patient_available);
     pthread_mutex_destroy(&child_mutex);
     pthread_mutex_destroy(&discharge_mutex);
+    pthread_mutex_destroy(&mmap_mutex);
 
     if (g_discharge_fd != -1) close(g_discharge_fd);
+
+    /* ── msync + munmap patient_records.dat ──────────────────────── */
+    if (mmap_records) {
+        size_t pr_size = MAX_PATIENTS * sizeof(PatientRecord);
+        msync(mmap_records, pr_size, MS_SYNC);
+        munmap(mmap_records, pr_size);
+        mmap_records = NULL;
+        printf("[ADMISSIONS] patient_records.dat flushed and unmapped.\n");
+    }
 
     detach_shared_memory(shm_ward);
 

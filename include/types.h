@@ -8,6 +8,7 @@
 #define ISOLATION_CAPACITY  4
 #define GENERAL_CAPACITY    12
 #define MAX_WAIT_QUEUE      20   /* bounded sem capacity: receptionist→scheduler */
+#define MAX_PATIENTS        100  /* mmap patient record log capacity             */
 #define SHM_KEY             0xBEDF00D
 
 typedef enum {
