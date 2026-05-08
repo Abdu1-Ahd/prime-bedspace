@@ -163,38 +163,10 @@ found:
     else              a->free_list      = chosen->next;
     free(chosen);
 
-    /* Mark partition occupied */
+    /* Mark partition occupied — physical bed, fixed size, no splitting */
     a->ward[idx].is_free = 0;
 
-    /* ── Split remainder ─────────────────────────────────────────── */
-    if (chosen_delta > 0) {
-        /* Look for an absorbed/zero-size slot at idx+1 to place the remainder */
-        int split_idx = idx + 1;
-        if (split_idx < a->total &&
-            a->ward[split_idx].size == 0) {
-            /* Materialise split remainder */
-            a->ward[split_idx].partition_id = split_idx;
-            a->ward[split_idx].start_unit   = a->ward[idx].start_unit + care_units;
-            a->ward[split_idx].size         = chosen_delta;
-            a->ward[split_idx].is_free      = 1;
-            a->ward[split_idx].patient_id   = -1;
-            strncpy(a->ward[split_idx].bed_type, a->ward[idx].bed_type,
-                    sizeof(a->ward[split_idx].bed_type) - 1);
-            fl_insert(a, split_idx);
-
-            /* Shrink allocated partition to exact fit */
-            a->ward[idx].size = care_units;
-
-            printf("[ALLOC] Split: partition %d (%d units) → alloc=%d, "
-                   "remainder at %d (%d units)\n",
-                   idx, care_units + chosen_delta,
-                   care_units, split_idx, chosen_delta);
-        }
-        /* If slot not available (live partition there), no split — first-fit
-         * behaviour degrades gracefully without corrupting real data.        */
-    }
-
-    /* ── Paging simulation (Task 4) ──────────────────────────────── */
+    /* ── Paging simulation ───────────────────────────────────────── */
     int pages_needed  = (care_units + PAGE_SIZE - 1) / PAGE_SIZE;
     int internal_frag = (pages_needed * PAGE_SIZE) - care_units;
     printf("[PAGING] Patient %d: %d care units → %d pages, "
@@ -206,45 +178,19 @@ found:
 
 /* ── ba_free ─────────────────────────────────────────────────────────── */
 
-void ba_free(BedAllocator *a, int idx) {
-    if (idx < 0 || idx >= a->total) return;
+void ba_free(BedAllocator *a, int partition_idx) {
+    if (partition_idx < 0 || partition_idx >= a->total) return;
 
-    ba_print_ward_map(a, "BEFORE coalesce");
+    ba_print_ward_map(a, "BEFORE free");
 
-    a->ward[idx].is_free    = 1;
-    a->ward[idx].patient_id = -1;
-    fl_insert(a, idx);
+    /* Mark bed free — physical beds are fixed partitions, never absorbed */
+    a->ward[partition_idx].is_free    = 1;
+    a->ward[partition_idx].patient_id = -1;
 
-    /* ── Left coalesce ───────────────────────────────────────────── */
-    if (idx > 0 &&
-        a->ward[idx - 1].is_free &&
-        a->ward[idx - 1].size > 0 &&
-        strcmp(a->ward[idx - 1].bed_type, a->ward[idx].bed_type) == 0) {
+    /* Re-insert into free list (sorted ascending by index) */
+    fl_insert(a, partition_idx);
 
-        a->ward[idx - 1].size += a->ward[idx].size;
-        a->ward[idx].size      = 0; /* mark absorbed */
-        fl_remove(a, idx);
-        idx = idx - 1; /* continue right-coalesce from merged node */
-
-        printf("[ALLOC] Left-coalesced: partition now at %d (size=%d)\n",
-               idx, a->ward[idx].size);
-    }
-
-    /* ── Right coalesce ──────────────────────────────────────────── */
-    if (idx + 1 < a->total &&
-        a->ward[idx + 1].is_free &&
-        a->ward[idx + 1].size > 0 &&
-        strcmp(a->ward[idx + 1].bed_type, a->ward[idx].bed_type) == 0) {
-
-        a->ward[idx].size += a->ward[idx + 1].size;
-        a->ward[idx + 1].size = 0; /* mark absorbed */
-        fl_remove(a, idx + 1);
-
-        printf("[ALLOC] Right-coalesced: partition %d absorbed into %d (size=%d)\n",
-               idx + 1, idx, a->ward[idx].size);
-    }
-
-    ba_print_ward_map(a, "AFTER coalesce");
+    ba_print_ward_map(a, "AFTER free");
     ba_fragmentation_report(a, g_mem_log);
 }
 
