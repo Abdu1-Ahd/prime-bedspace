@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -pthread
+CFLAGS = -Wall -Wextra -pthread -Iinclude
 LDFLAGS = -lrt -lpthread
 BUILD_DIR = build
 SRC_DIR = src

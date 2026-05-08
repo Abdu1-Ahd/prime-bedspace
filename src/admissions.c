@@ -2,8 +2,8 @@
  * ==============================================================================
  * Project: Prime BedSpace
  * File: admissions.c
- * Group: <Group XX>
- * Members: <Member 1>, <Member 2>
+ * Group: Zawiar & Subhani
+ * Members: Abdul Ahad Zawiar (Abdu1-Ahd), AbdulRahim Subhani (abdulrahim-subh)
  * Date: 2026-05-08
  * Purpose: Main admissions manager using fork/exec and IPC FIFOs.
  * Compile: gcc -Wall -Wextra -pthread src/admissions.c src/scheduler.c src/bed_allocator.c src/ipc_utils.c src/terminal_ui.c -o build/admissions -lrt
@@ -12,6 +12,7 @@
  */
 
 #include "types.h"
+#include "ipc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,7 +24,7 @@
 
 pid_t child_pids[50];
 int child_count = 0;
-BedPartition ward[MAX_BEDS];
+BedPartition *shm_ward = NULL;
 volatile sig_atomic_t running = 1;
 
 void sigchld_handler(int sig) {
@@ -48,9 +49,22 @@ void sigterm_handler(int sig) {
     running = 0;
 }
 
-void admit_patient(PatientRecord *p, int bed_id) {
+void admit_patient(PatientRecord *p) {
     if (child_count >= 50) {
         fprintf(stderr, "[ADMISSIONS] Queue full.\n");
+        return;
+    }
+
+    int bed_id = -1;
+    for (int i = 0; i < MAX_BEDS; i++) {
+        if (shm_ward[i].is_free == 1 && shm_ward[i].size >= p->care_units) {
+            bed_id = i;
+            break;
+        }
+    }
+
+    if (bed_id == -1) {
+        printf("[ADMISSIONS] No suitable bed available for patient %d. Queuing.\n", p->patient_id);
         return;
     }
 
@@ -74,7 +88,7 @@ void admit_patient(PatientRecord *p, int bed_id) {
             patient_id_str,
             triage_str,
             bed_id_str,
-            ward[bed_id].bed_type,
+            shm_ward[bed_id].bed_type,
             NULL
         };
 
@@ -83,32 +97,39 @@ void admit_patient(PatientRecord *p, int bed_id) {
         exit(1);
     } else {
         child_pids[child_count++] = pid;
-        ward[bed_id].is_free = 0;
-        ward[bed_id].patient_id = p->patient_id;
-        printf("[ADMISSIONS] Patient %d admitted to %s bed %d\n", p->patient_id, ward[bed_id].bed_type, bed_id);
+        shm_ward[bed_id].is_free = 0;
+        shm_ward[bed_id].patient_id = p->patient_id;
+        printf("[ADMISSIONS] Patient %d admitted to %s bed %d\n", p->patient_id, shm_ward[bed_id].bed_type, bed_id);
     }
 }
 
 int main(void) {
+    shm_ward = (BedPartition *)init_shared_memory();
+    if (shm_ward == NULL) {
+        fprintf(stderr, "[ADMISSIONS] Shared memory initialization failed.\n");
+        exit(1);
+    }
+
     for (int i = 0; i < MAX_BEDS; i++) {
-        ward[i].partition_id = i;
-        ward[i].is_free = 1;
-        ward[i].patient_id = -1;
+        shm_ward[i].partition_id = i;
+        shm_ward[i].is_free = 1;
+        shm_ward[i].patient_id = -1;
 
         if (i < 4) {
-            strcpy(ward[i].bed_type, "ICU");
-            ward[i].size = 3;
-            ward[i].start_unit = i * 3;
+            strcpy(shm_ward[i].bed_type, "ICU");
+            shm_ward[i].size = 3;
+            shm_ward[i].start_unit = i * 3;
         } else if (i < 8) {
-            strcpy(ward[i].bed_type, "ISOLATION");
-            ward[i].size = 2;
-            ward[i].start_unit = 12 + (i - 4) * 2;
+            strcpy(shm_ward[i].bed_type, "ISOLATION");
+            shm_ward[i].size = 2;
+            shm_ward[i].start_unit = 12 + (i - 4) * 2;
         } else {
-            strcpy(ward[i].bed_type, "GENERAL");
-            ward[i].size = 1;
-            ward[i].start_unit = 20 + (i - 8);
+            strcpy(shm_ward[i].bed_type, "GENERAL");
+            shm_ward[i].size = 1;
+            shm_ward[i].start_unit = 20 + (i - 8);
         }
     }
+    printf("[ADMISSIONS] Shared memory initialized.\n");
 
     struct sigaction sa_chld;
     memset(&sa_chld, 0, sizeof(sa_chld));
@@ -121,26 +142,27 @@ int main(void) {
     sa_term.sa_handler = sigterm_handler;
     sigaction(SIGTERM, &sa_term, NULL);
 
-    int fd = open("/tmp/discharge_fifo", O_RDONLY | O_NONBLOCK);
+    int fd = open_discharge_fifo_read();
 
     while (running == 1) {
         if (fd != -1) {
-            char buf[64];
-            ssize_t bytes_read = read(fd, buf, sizeof(buf) - 1);
-            if (bytes_read > 0) {
-                buf[bytes_read] = '\0';
+            char buf[32];
+            ssize_t n;
+            while ((n = read(fd, buf, sizeof(buf) - 1)) > 0) {
+                buf[n] = '\0';
+                buf[strcspn(buf, "\n\r ")] = '\0';
                 int discharged_id = atoi(buf);
                 for (int i = 0; i < MAX_BEDS; i++) {
-                    if (!ward[i].is_free && ward[i].patient_id == discharged_id) {
-                        ward[i].is_free = 1;
-                        ward[i].patient_id = -1;
+                    if (!shm_ward[i].is_free && shm_ward[i].patient_id == discharged_id) {
+                        shm_ward[i].is_free = 1;
+                        shm_ward[i].patient_id = -1;
                         printf("[ADMISSIONS] Bed freed for patient %d\n", discharged_id);
                         break;
                     }
                 }
             }
         } else {
-            fd = open("/tmp/discharge_fifo", O_RDONLY | O_NONBLOCK);
+            fd = open_discharge_fifo_read();
         }
 
         sleep(1);
@@ -149,6 +171,7 @@ int main(void) {
     if (fd != -1) {
         close(fd);
     }
+    detach_shared_memory(shm_ward);
     printf("[ADMISSIONS] Shutting down.\n");
     return 0;
 }
