@@ -2,8 +2,8 @@
 # ==============================================================================
 # Project: Prime BedSpace
 # Script: stop_hospital.sh
-# Group: <Group XX>
-# Members: <Member 1>, <Member 2>
+# Group: Zawiar & Subhani
+# Members: Abdul Ahad Zawiar (Abdu1-Ahd), AbdulRahim Subhani (abdulrahim-subh)
 # Date: 2026-05-08
 # Purpose: Safely terminates the hospital simulation and cleans up 
 #          IPC resources (FIFOs, PID files).

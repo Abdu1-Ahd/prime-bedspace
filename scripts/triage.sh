@@ -2,8 +2,8 @@
 # ==============================================================================
 # Project: Prime BedSpace
 # Script: triage.sh
-# Group: Hospital Sim Group
-# Members: User
+# Group: Zawiar & Subhani
+# Members: Abdul Ahad Zawiar (Abdu1-Ahd), AbdulRahim Subhani (abdulrahim-subh)
 # Date: 2026-05-08
 # Purpose: Validates patient triage inputs, assigns priority and care units,
 #          and outputs formatted data.

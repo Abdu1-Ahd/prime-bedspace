@@ -2,8 +2,8 @@
 # ==============================================================================
 # Project: Prime BedSpace
 # Script: start_hospital.sh
-# Group: <Group XX>
-# Members: <Member 1>, <Member 2>
+# Group: Zawiar & Subhani
+# Members: Abdul Ahad Zawiar (Abdu1-Ahd), AbdulRahim Subhani (abdulrahim-subh)
 # Date: 2026-05-08
 # Purpose: Initializes the hospital simulation, sets up IPC components,
 #          and launches the main admissions manager.
