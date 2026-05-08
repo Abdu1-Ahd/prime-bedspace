@@ -15,7 +15,7 @@ typedef struct {
 void pq_init(PriorityQueue *pq);
 int pq_push(PriorityQueue *pq, PatientRecord p);
 PatientRecord pq_pop(PriorityQueue *pq);
-PatientRecord *pq_peek(PriorityQueue *pq);
+int pq_peek_copy(PriorityQueue *pq, PatientRecord *out); /* 1=ok, 0=empty */
 int pq_is_empty(PriorityQueue *pq);
 int pq_size(PriorityQueue *pq);
 
