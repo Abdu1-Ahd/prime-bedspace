@@ -95,13 +95,16 @@ PatientRecord pq_pop(PriorityQueue *pq) {
     return result;
 }
 
-/* Peek at minimum without removing. Returns NULL if empty.
-   Caller must NOT hold the lock already. */
-PatientRecord *pq_peek(PriorityQueue *pq) {
+/* Copy top element without removing. Returns 1 on success, 0 if empty.
+   Thread-safe: copies value while holding lock, no pointer escapes. */
+int pq_peek_copy(PriorityQueue *pq, PatientRecord *out) {
     pthread_mutex_lock(&pq->lock);
-    PatientRecord *top = (pq->size > 0) ? &pq->heap[0] : NULL;
+    int has = (pq->size > 0);
+    if (has && out != NULL) {
+        *out = pq->heap[0];
+    }
     pthread_mutex_unlock(&pq->lock);
-    return top;
+    return has;
 }
 
 int pq_is_empty(PriorityQueue *pq) {

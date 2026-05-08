@@ -24,6 +24,14 @@ if [ -p "/tmp/discharge_fifo" ]; then
     rm -f /tmp/discharge_fifo
 fi
 
+if [ -p "/tmp/triage_fifo" ]; then
+    rm -f /tmp/triage_fifo
+fi
+
+# Unlink named POSIX semaphores
+[ -e /dev/shm/sem.sem_icu_limit ]       && rm -f /dev/shm/sem.sem_icu_limit
+[ -e /dev/shm/sem.sem_isolation_limit ] && rm -f /dev/shm/sem.sem_isolation_limit
+
 rm -f /tmp/hospital.pid
 
 YELLOW='\033[1;33m'
