@@ -4,10 +4,17 @@
 #include <time.h>
 
 #define MAX_BEDS 20
-#define ICU_CAPACITY 4
-#define ISOLATION_CAPACITY 4
-#define GENERAL_CAPACITY 12
-#define SHM_KEY 0xBEDF00D
+#define ICU_CAPACITY        4
+#define ISOLATION_CAPACITY  4
+#define GENERAL_CAPACITY    12
+#define MAX_WAIT_QUEUE      20   /* bounded sem capacity: receptionist→scheduler */
+#define SHM_KEY             0xBEDF00D
+
+typedef enum {
+    NURSE_ICU = 0,
+    NURSE_ISOLATION,
+    NURSE_GENERAL
+} NurseType;
 
 typedef struct {
     int patient_id;

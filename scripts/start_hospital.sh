@@ -21,10 +21,19 @@ if [ ! -f "./build/admissions" ]; then
     exit 1
 fi
 
-# TODO: Create named semaphores using a small C helper once available
+# Clean up any stale named semaphores from a previous crash
+# (Linux stores POSIX named semaphores in /dev/shm as sem.<name>)
+[ -e /dev/shm/sem.sem_icu_limit ]       && rm -f /dev/shm/sem.sem_icu_limit       && echo "[INIT] Removed stale /sem_icu_limit"
+[ -e /dev/shm/sem.sem_isolation_limit ] && rm -f /dev/shm/sem.sem_isolation_limit  && echo "[INIT] Removed stale /sem_isolation_limit"
 
+# Create POSIX FIFOs (discharge channel + triage input channel)
 if [ ! -p "/tmp/discharge_fifo" ]; then
     mkfifo /tmp/discharge_fifo
+    echo "[INIT] Created /tmp/discharge_fifo"
+fi
+if [ ! -p "/tmp/triage_fifo" ]; then
+    mkfifo /tmp/triage_fifo
+    echo "[INIT] Created /tmp/triage_fifo"
 fi
 
 ./build/admissions &
