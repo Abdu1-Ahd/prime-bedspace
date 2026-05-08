@@ -55,23 +55,6 @@ static void fl_insert(BedAllocator *a, int idx) {
     cur->next = n;
 }
 
-/* Remove the node for idx from free_list. Returns 1 if found, 0 otherwise. */
-static int fl_remove(BedAllocator *a, int idx) {
-    FreeNode *cur  = a->free_list;
-    FreeNode *prev = NULL;
-
-    while (cur) {
-        if (cur->partition_idx == idx) {
-            if (prev) prev->next = cur->next;
-            else       a->free_list = cur->next;
-            free(cur);
-            return 1;
-        }
-        prev = cur;
-        cur  = cur->next;
-    }
-    return 0;
-}
 
 /* ── ba_init ─────────────────────────────────────────────────────────── */
 
@@ -102,13 +85,12 @@ void ba_init(BedAllocator *a, BedPartition *ward, int total, AllocStrategy s) {
 
 int ba_alloc(BedAllocator *a, int care_units, const char *bed_type,
              int patient_id_hint) {
-    FreeNode *chosen     = NULL;
+    FreeNode *chosen      = NULL;
     FreeNode *chosen_prev = NULL;
-    int       chosen_delta = 0; /* size - care_units for chosen node */
 
-    /* Initialise delta sentinels per strategy */
-    int best_delta  =  1 << 30; /* BEST:  minimise surplus           */
-    int worst_delta = -1;       /* WORST: maximise surplus           */
+    /* Sentinels for strategy selection */
+    int best_delta  =  1 << 30; /* BEST:  minimise surplus  */
+    int worst_delta = -1;       /* WORST: maximise surplus  */
 
     FreeNode *cur  = a->free_list;
     FreeNode *prev = NULL;
