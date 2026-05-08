@@ -63,11 +63,23 @@ int open_discharge_fifo_write(void) {
     return fd;
 }
 
-/* Open triage FIFO for non-blocking read. Returns fd or -1. */
+/* Open triage FIFO for non-blocking read. Returns fd or -1.
+ * Use for retry loops where the FIFO may not exist yet. */
 int open_triage_fifo_read(void) {
     int fd = open(FIFO_TRIAGE_PATH, O_RDONLY | O_NONBLOCK);
     if (fd == -1 && errno != ENXIO && errno != ENOENT) {
         perror("[IPC] open triage FIFO read");
+    }
+    return fd;
+}
+
+/* Open triage FIFO for BLOCKING read (no O_NONBLOCK).
+ * Used by the receptionist thread after the FIFO is confirmed to exist.
+ * read() on this fd will block until data arrives — no busy-spin needed. */
+int open_triage_fifo_read_block(void) {
+    int fd = open(FIFO_TRIAGE_PATH, O_RDONLY); /* blocking */
+    if (fd == -1) {
+        perror("[IPC] open triage FIFO read (blocking)");
     }
     return fd;
 }

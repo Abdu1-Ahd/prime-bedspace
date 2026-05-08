@@ -14,7 +14,8 @@ void  detach_shared_memory(void *ptr);
 /* ── FIFO helpers ────────────────────────────────────────────────────── */
 int open_discharge_fifo_read(void);
 int open_discharge_fifo_write(void);
-int open_triage_fifo_read(void);
+int open_triage_fifo_read(void);        /* non-blocking, for retry loops  */
+int open_triage_fifo_read_block(void);  /* blocking O_RDONLY, for read()  */
 int open_triage_fifo_write(void);
 
 #endif /* IPC_H */

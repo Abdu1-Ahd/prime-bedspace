@@ -68,6 +68,27 @@ static pid_t child_pids[50];
 static int   child_count = 0;
 static pthread_mutex_t child_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/*
+ * Lock ordering (always acquire in this order to prevent deadlock):
+ *   1. queue_mutex       — protects g_wait_queue (priority queue)
+ *   2. discharge_mutex   — protects shared discharge FIFO reads
+ *   3. bed_mutex         — protects shm_ward[] bed bitmap
+ * sem_icu / sem_isolation are acquired BEFORE bed_mutex in scheduler thread.
+ * sem_queue is posted/waited outside all mutexes.
+ * Never hold bed_mutex when calling fork().
+ */
+static pthread_mutex_t discharge_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Shared discharge fd — opened once in main(), read by all nurse threads
+ * under discharge_mutex. If a patient_id does not belong to a nurse's range,
+ * it is stored in lost_ids[] for another nurse to reclaim on its next pass. */
+static int g_discharge_fd = -1;
+
+/* Round-robin fallback buffer: up to 3 pending IDs not yet claimed by a nurse */
+#define LOST_IDS_MAX 3
+static int  lost_ids[LOST_IDS_MAX];
+static int  lost_ids_count = 0;
+
 /* ── Signal handlers ─────────────────────────────────────────────────── */
 
 static void sigchld_handler(int sig) {
@@ -115,34 +136,49 @@ static int find_best_fit_bed(int care_units) {
     return best;
 }
 
-/* Fork and exec patient_simulator. MUST be called with bed_mutex held.
-   Releases bed_mutex briefly around fork to avoid deadlock in child. */
+/* Fork and exec patient_simulator for patient p in bed_id.
+ *
+ * PRECONDITION: bed_mutex must NOT be held by the caller.
+ * The caller (thread_scheduler) marks shm_ward[bed_id] as OCCUPIED and
+ * unlocks bed_mutex BEFORE calling this function, ensuring fork() is
+ * never called with any mutex held (prevents child inheriting locked state).
+ *
+ * On fork failure: re-acquires bed_mutex, reverts bed to free, broadcasts
+ * bed_freed so the scheduler thread can retry with the next patient.
+ */
 static void do_admit_to_bed(PatientRecord *p, int bed_id) {
     pthread_mutex_lock(&child_mutex);
     if (child_count >= 50) {
         fprintf(stderr, "[ADMISSIONS] child_pids table full — cannot fork.\n");
         pthread_mutex_unlock(&child_mutex);
+        /* Revert: re-acquire bed_mutex, reset bed, broadcast */
+        pthread_mutex_lock(&bed_mutex);
+        shm_ward[bed_id].is_free    = 1;
+        shm_ward[bed_id].patient_id = -1;
+        pthread_cond_broadcast(&bed_freed);
+        pthread_mutex_unlock(&bed_mutex);
         return;
     }
     pthread_mutex_unlock(&child_mutex);
 
+    /* Snapshot bed_type before fork (read-only after marking; safe without lock) */
+    char bed_type_snap[16];
+    strncpy(bed_type_snap, shm_ward[bed_id].bed_type, sizeof(bed_type_snap) - 1);
+    bed_type_snap[sizeof(bed_type_snap) - 1] = '\0';
+
     time_t admit_time = time(NULL);
 
-    /* Mark bed occupied BEFORE fork (under bed_mutex already held by caller) */
-    shm_ward[bed_id].is_free    = 0;
-    shm_ward[bed_id].patient_id = p->patient_id;
-
-    /* Release bed_mutex around fork to avoid child inheriting a locked mutex */
-    pthread_mutex_unlock(&bed_mutex);
-
+    /* ── fork() — NO mutex held ────────────────────────────────────── */
     pid_t pid = fork();
 
     if (pid < 0) {
         perror("[ADMISSIONS] fork failed");
-        /* Re-acquire and revert bed state */
+        /* Revert bed under bed_mutex, wake scheduler */
         pthread_mutex_lock(&bed_mutex);
         shm_ward[bed_id].is_free    = 1;
         shm_ward[bed_id].patient_id = -1;
+        pthread_cond_broadcast(&bed_freed);
+        pthread_mutex_unlock(&bed_mutex);
         return;
     }
 
@@ -158,7 +194,7 @@ static void do_admit_to_bed(PatientRecord *p, int bed_id) {
             patient_id_str,
             triage_str,
             bed_id_str,
-            shm_ward[bed_id].bed_type,
+            bed_type_snap,
             NULL
         };
         execv("./build/patient_simulator", args);
@@ -172,14 +208,10 @@ static void do_admit_to_bed(PatientRecord *p, int bed_id) {
     pthread_mutex_unlock(&child_mutex);
 
     printf("[ADMISSIONS] Patient %d admitted to %s bed %d (priority %d)\n",
-           p->patient_id, shm_ward[bed_id].bed_type, bed_id, p->priority);
+           p->patient_id, bed_type_snap, bed_id, p->priority);
 
-    /* Log admission event for scheduling simulation */
     log_admission_event(p->patient_id, p->priority,
                         p->arrival_time, admit_time, p->care_units);
-
-    /* Re-acquire bed_mutex so caller's lock discipline is intact */
-    pthread_mutex_lock(&bed_mutex);
 }
 
 /* ── Thread: Receptionist ────────────────────────────────────────────── */
@@ -190,27 +222,32 @@ static void *thread_receptionist(void *arg) {
            FIFO_TRIAGE_PATH);
 
     int fd = -1;
-    /* Retry loop: FIFO may not exist yet until start_hospital.sh creates it */
+    /* Phase 1: spin with non-blocking open until the FIFO exists */
     while (fd == -1 && running) {
-        fd = open_triage_fifo_read();
+        fd = open_triage_fifo_read();   /* O_NONBLOCK — returns -1 if not ready */
+        if (fd == -1) sleep(1);
+    }
+    close(fd); /* discard the non-blocking fd */
+    fd = -1;
+
+    /* Phase 2: reopen with blocking O_RDONLY — read() will block until data */
+    while (fd == -1 && running) {
+        fd = open_triage_fifo_read_block();
         if (fd == -1) sleep(1);
     }
 
     char buf[256];
 
     while (running) {
+        /* Blocking read — no busy-spin, no usleep, no EAGAIN */
         ssize_t n = read(fd, buf, sizeof(buf) - 1);
 
         if (n <= 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(50000); /* 50ms poll */
-                continue;
-            }
-            /* FIFO closed — reopen */
+            /* n == 0: writer closed the FIFO (EOF). Reopen blocking fd. */
             close(fd);
             fd = -1;
             while (fd == -1 && running) {
-                fd = open_triage_fifo_read();
+                fd = open_triage_fifo_read_block();
                 if (fd == -1) sleep(1);
             }
             continue;
@@ -262,7 +299,7 @@ static void *thread_receptionist(void *arg) {
                    p.patient_id, p.priority, depth);
             pthread_cond_signal(&patient_available);
         } else {
-            /* Queue struct full (>100) — return the semaphore slot */
+            /* PQ heap full (>100) — return the semaphore slot */
             fprintf(stderr,
                     "[RECEPTIONIST] PQ full — patient %d dropped.\n",
                     p.patient_id);
@@ -325,7 +362,7 @@ static void *thread_scheduler(void *arg) {
 
         int bed_id = find_best_fit_bed(p.care_units);
 
-        /* If no bed is available, wait for nurse to broadcast bed_freed */
+        /* If no bed available, wait for a nurse to broadcast bed_freed */
         while (bed_id == -1 && running) {
             printf("[SCHEDULER] No bed for patient %d — waiting on bed_freed.\n",
                    p.patient_id);
@@ -336,14 +373,18 @@ static void *thread_scheduler(void *arg) {
         if (!running) {
             pthread_mutex_unlock(&bed_mutex);
             /* Return semaphore since we never admitted */
-            if (p.care_units >= 3)     sem_post(&sem_icu);
+            if (p.care_units >= 3)      sem_post(&sem_icu);
             else if (p.care_units == 2) sem_post(&sem_isolation);
             break;
         }
 
-        /* do_admit_to_bed releases and re-acquires bed_mutex around fork */
-        do_admit_to_bed(&p, bed_id);
+        /* Mark bed OCCUPIED while still holding bed_mutex, then unlock.
+         * do_admit_to_bed() is called with NO mutex held so fork() is safe. */
+        shm_ward[bed_id].is_free    = 0;
+        shm_ward[bed_id].patient_id = p.patient_id;
         pthread_mutex_unlock(&bed_mutex);
+
+        do_admit_to_bed(&p, bed_id); /* fork() happens here, no mutex held */
     }
 
     printf("[SCHEDULER] Thread exiting.\n");
@@ -376,37 +417,79 @@ static void *thread_nurse(void *arg) {
     printf("[%s] Thread started. Monitoring beds %d-%d.\n",
            label, range_start, range_end);
 
-    int fd = -1;
-    while (fd == -1 && running) {
-        fd = open_discharge_fifo_read();
-        if (fd == -1) sleep(1);
-    }
-
     char buf[64];
 
     while (running) {
-        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        int discharged_id = 0;
 
-        if (n <= 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(100000); /* 100ms poll */
-                continue;
+        /* ── Step 1: check lost_ids[] buffer first (discharge_mutex held) ─
+         * lost_ids[] holds patient IDs read by another nurse that didn't match
+         * that nurse's bed range. This nurse checks if any belong to its range.
+         * This is a simple round-robin fallback, not a full routing layer.     */
+        pthread_mutex_lock(&discharge_mutex);
+        for (int i = 0; i < lost_ids_count; i++) {
+            /* Peek at shm_ward WITHOUT bed_mutex here — only reading patient_id
+             * to see if it's in our range. bed_mutex is acquired below for
+             * the actual free operation (lock order: discharge → bed).         */
+            for (int b = range_start; b <= range_end; b++) {
+                if (!shm_ward[b].is_free &&
+                    shm_ward[b].patient_id == lost_ids[i]) {
+                    discharged_id = lost_ids[i];
+                    /* Remove from lost_ids[] by compacting */
+                    for (int j = i; j < lost_ids_count - 1; j++)
+                        lost_ids[j] = lost_ids[j + 1];
+                    lost_ids_count--;
+                    break;
+                }
             }
-            close(fd);
-            fd = -1;
-            while (fd == -1 && running) {
-                fd = open_discharge_fifo_read();
-                if (fd == -1) sleep(1);
+            if (discharged_id > 0) break;
+        }
+
+        /* ── Step 2: if no pending lost id, read a new one from the shared fd */
+        if (discharged_id == 0 && g_discharge_fd != -1) {
+            ssize_t n = read(g_discharge_fd, buf, sizeof(buf) - 1);
+
+            if (n > 0) {
+                buf[n] = '\0';
+                buf[strcspn(buf, "\n\r ")] = '\0';
+                int id = atoi(buf);
+
+                if (id > 0) {
+                    /* Check if this id belongs to our bed range */
+                    int mine = 0;
+                    for (int b = range_start; b <= range_end; b++) {
+                        if (!shm_ward[b].is_free &&
+                            shm_ward[b].patient_id == id) {
+                            mine = 1;
+                            break;
+                        }
+                    }
+
+                    if (mine) {
+                        discharged_id = id;
+                    } else if (lost_ids_count < LOST_IDS_MAX) {
+                        /* Not ours — park in lost_ids[] for another nurse */
+                        lost_ids[lost_ids_count++] = id;
+                        printf("[%s] Patient %d not in range — parked in "
+                               "lost_ids[] (count=%d)\n",
+                               label, id, lost_ids_count);
+                    } else {
+                        fprintf(stderr, "[%s] lost_ids[] full — patient %d "
+                                "discharge event dropped.\n", label, id);
+                    }
+                }
+            } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                perror("[NURSE] read discharge FIFO");
             }
+        }
+        pthread_mutex_unlock(&discharge_mutex);
+
+        if (discharged_id <= 0) {
+            usleep(100000); /* 100ms — no event this iteration */
             continue;
         }
 
-        buf[n] = '\0';
-        buf[strcspn(buf, "\n\r ")] = '\0';
-
-        int discharged_id = atoi(buf);
-        if (discharged_id <= 0) continue;
-
+        /* ── Step 3: free the bed (bed_mutex, lock order: discharge→bed ── */
         pthread_mutex_lock(&bed_mutex);
 
         int freed_bed = -1;
@@ -419,7 +502,6 @@ static void *thread_nurse(void *arg) {
         }
 
         if (freed_bed == -1) {
-            /* This discharge belongs to a different nurse type's range */
             pthread_mutex_unlock(&bed_mutex);
             continue;
         }
@@ -428,24 +510,22 @@ static void *thread_nurse(void *arg) {
         shm_ward[freed_bed].patient_id = -1;
 
         /* ── Left+Right coalescing ──────────────────────────────────── */
-        /* Merge with left neighbour if same type and free */
         int coalesced = 0;
         if (freed_bed > range_start &&
             shm_ward[freed_bed - 1].is_free &&
             strcmp(shm_ward[freed_bed - 1].bed_type,
                    shm_ward[freed_bed].bed_type) == 0) {
             shm_ward[freed_bed - 1].size += shm_ward[freed_bed].size;
-            shm_ward[freed_bed].size = 0; /* absorbed */
+            shm_ward[freed_bed].size = 0;
             coalesced = 1;
         }
-        /* Merge with right neighbour if same type and free */
         if (freed_bed < range_end &&
             shm_ward[freed_bed + 1].is_free &&
             strcmp(shm_ward[freed_bed + 1].bed_type,
                    shm_ward[freed_bed].bed_type) == 0) {
-            int merge_target = (coalesced) ? freed_bed - 1 : freed_bed;
+            int merge_target = coalesced ? freed_bed - 1 : freed_bed;
             shm_ward[merge_target].size += shm_ward[freed_bed + 1].size;
-            shm_ward[freed_bed + 1].size = 0; /* absorbed */
+            shm_ward[freed_bed + 1].size = 0;
             coalesced = 1;
         }
 
@@ -454,19 +534,13 @@ static void *thread_nurse(void *arg) {
                label, freed_bed, discharged_id,
                coalesced ? "yes" : "no");
 
-        /* Release ward-type semaphore slot */
-        if (type == NURSE_ICU) {
-            sem_post(&sem_icu);
-        } else if (type == NURSE_ISOLATION) {
-            sem_post(&sem_isolation);
-        }
+        if (type == NURSE_ICU)        sem_post(&sem_icu);
+        else if (type == NURSE_ISOLATION) sem_post(&sem_isolation);
 
-        /* Broadcast so scheduler thread re-checks for available beds */
         pthread_cond_broadcast(&bed_freed);
         pthread_mutex_unlock(&bed_mutex);
     }
 
-    if (fd != -1) close(fd);
     printf("[%s] Thread exiting.\n", label);
     return NULL;
 }
@@ -525,6 +599,14 @@ int main(void) {
     sa_term.sa_handler = sigterm_handler;
     sigaction(SIGTERM, &sa_term, NULL);
 
+    /* ── Open shared discharge FIFO once (Fix 3: single fd, no race) ── */
+    /* Retry until patient_simulator has created the FIFO via the script */
+    while (g_discharge_fd == -1) {
+        g_discharge_fd = open_discharge_fifo_read();
+        if (g_discharge_fd == -1) sleep(1);
+    }
+    printf("[ADMISSIONS] Discharge FIFO open (fd=%d).\n", g_discharge_fd);
+
     /* ── Thread launch ───────────────────────────────────────────────── */
     pthread_t t_receptionist, t_scheduler;
     pthread_t t_nurse_icu, t_nurse_isolation, t_nurse_general;
@@ -572,6 +654,9 @@ int main(void) {
     pthread_mutex_destroy(&queue_mutex);
     pthread_cond_destroy(&patient_available);
     pthread_mutex_destroy(&child_mutex);
+    pthread_mutex_destroy(&discharge_mutex);
+
+    if (g_discharge_fd != -1) close(g_discharge_fd);
 
     detach_shared_memory(shm_ward);
 
