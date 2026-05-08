@@ -39,6 +39,7 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include <errno.h>
+#include <sys/stat.h>   /* mkfifo() */
 
 /* ── Synchronization primitives ─────────────────────────────────────── */
 
@@ -647,11 +648,29 @@ int main(int argc, char *argv[]) {
     sa_term.sa_handler = sigterm_handler;
     sigaction(SIGTERM, &sa_term, NULL);
 
-    /* ── Open shared discharge FIFO once (Fix 3: single fd, no race) ── */
-    /* Retry until patient_simulator has created the FIFO via the script */
-    while (g_discharge_fd == -1) {
-        g_discharge_fd = open_discharge_fifo_read();
-        if (g_discharge_fd == -1) sleep(1);
+    /* ── Create FIFOs if they don't exist yet (Phase 4 self-contained start) */
+    /* mkfifo() with EEXIST ignored — safe to call every run */
+    if (mkfifo(FIFO_TRIAGE_PATH, 0666) == -1 && errno != EEXIST) {
+        perror("[ADMISSIONS] mkfifo triage");
+        exit(1);
+    }
+    if (mkfifo(FIFO_DISCHARGE_PATH, 0666) == -1 && errno != EEXIST) {
+        perror("[ADMISSIONS] mkfifo discharge");
+        exit(1);
+    }
+    printf("[ADMISSIONS] FIFOs ready.\n");
+
+    /* ── Terminal UI — start before FIFO open so user sees the ward ─── */
+    ui_start(shm_ward, MAX_BEDS, g_strategy_name);
+
+    /* ── Open shared discharge FIFO (O_RDWR avoids blocking for a writer) */
+    /* Using O_RDWR on a FIFO is a POSIX trick: the fd is readable but the
+     * process holds the write-end reference itself, so open() never blocks.
+     * Nurse threads read patient_ids from this fd under discharge_mutex.  */
+    g_discharge_fd = open(FIFO_DISCHARGE_PATH, O_RDWR);
+    if (g_discharge_fd == -1) {
+        perror("[ADMISSIONS] open discharge FIFO");
+        exit(1);
     }
     printf("[ADMISSIONS] Discharge FIFO open (fd=%d).\n", g_discharge_fd);
 
@@ -666,9 +685,6 @@ int main(int argc, char *argv[]) {
     pthread_create(&t_nurse_general,  NULL, thread_nurse, (void *)(intptr_t)NURSE_GENERAL);
 
     printf("[ADMISSIONS] 5 threads launched (1 receptionist, 1 scheduler, 3 nurses).\n");
-
-    /* ── Terminal UI (Phase 4, Task 6) ─────────────────────────── */
-    ui_start(shm_ward, MAX_BEDS, g_strategy_name);
 
     /* ── Main thread: wait for SIGTERM ──────────────────────────────── */
     while (running) {

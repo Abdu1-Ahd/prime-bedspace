@@ -26,17 +26,13 @@ fi
 [ -e /dev/shm/sem.sem_icu_limit ]       && rm -f /dev/shm/sem.sem_icu_limit       && echo "[INIT] Removed stale /sem_icu_limit"
 [ -e /dev/shm/sem.sem_isolation_limit ] && rm -f /dev/shm/sem.sem_isolation_limit  && echo "[INIT] Removed stale /sem_isolation_limit"
 
-# Create POSIX FIFOs (discharge channel + triage input channel)
-if [ ! -p "/tmp/discharge_fifo" ]; then
-    mkfifo /tmp/discharge_fifo
-    echo "[INIT] Created /tmp/discharge_fifo"
-fi
-if [ ! -p "/tmp/triage_fifo" ]; then
-    mkfifo /tmp/triage_fifo
-    echo "[INIT] Created /tmp/triage_fifo"
-fi
+# FIFOs are now created by admissions.c itself (mkfifo with EEXIST ignore).
+# Pre-create here too so they exist before admissions opens them.
+[ -p "/tmp/discharge_fifo" ] || mkfifo /tmp/discharge_fifo && echo "[INIT] discharge_fifo ready"
+[ -p "/tmp/triage_fifo" ]    || mkfifo /tmp/triage_fifo    && echo "[INIT] triage_fifo ready"
 
-./build/admissions &
+STRATEGY="${1:-best}"   # default best; override: ./start_hospital.sh first
+./build/admissions --strategy "$STRATEGY" &
 PID=$!
 echo $PID > /tmp/hospital.pid
 
