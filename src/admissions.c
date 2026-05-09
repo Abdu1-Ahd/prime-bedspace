@@ -27,6 +27,7 @@
 #include "scheduler.h"
 #include "bed_allocator.h"
 #include "terminal_ui.h"
+#include "debug_log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +41,7 @@
 #include <semaphore.h>
 #include <errno.h>
 #include <sys/stat.h>   /* mkfifo() */
+#include <poll.h>
 
 /* ── Synchronization primitives ─────────────────────────────────────── */
 
@@ -131,6 +133,11 @@ static void sigterm_handler(int sig) {
     /* Wake all waiting threads so they can observe running=0 and exit */
     pthread_cond_broadcast(&patient_available);
     pthread_cond_broadcast(&bed_freed);
+
+    // #region agent log (H5: shutdown path reached)
+    dbg_write_ndjson("pre", "H5", "admissions.c:sigterm_handler", "sigterm_received",
+                     "{\"running\":0}");
+    // #endregion
 }
 
 /* ── Internal helpers ────────────────────────────────────────────────── */
@@ -228,39 +235,58 @@ static void *thread_receptionist(void *arg) {
     printf("[RECEPTIONIST] Thread started. Waiting for triage FIFO: %s\n",
            FIFO_TRIAGE_PATH);
 
-    int fd = -1;
-    /* Phase 1: spin with non-blocking open until the FIFO exists */
-    while (fd == -1 && running) {
-        fd = open_triage_fifo_read();   /* O_NONBLOCK — returns -1 if not ready */
-        if (fd == -1) sleep(1);
-    }
-    close(fd); /* discard the non-blocking fd */
-    fd = -1;
+    // #region agent log (H5: receptionist lifecycle)
+    dbg_write_ndjson("pre", "H5", "admissions.c:thread_receptionist", "start", "{}");
+    // #endregion
 
-    /* Phase 2: reopen with blocking O_RDONLY — read() will block until data */
+    int fd = -1;
+    /* Open triage FIFO in NONBLOCK mode and wait via poll().
+     * This avoids getting stuck in a blocking open/read during shutdown. */
     while (fd == -1 && running) {
-        fd = open_triage_fifo_read_block();
+        fd = open_triage_fifo_read(); /* O_RDONLY|O_NONBLOCK */
         if (fd == -1) sleep(1);
     }
 
     char buf[256];
 
     while (running) {
-        /* Blocking read — no busy-spin, no usleep, no EAGAIN */
+        struct pollfd pfd;
+        pfd.fd     = fd;
+        pfd.events = POLLIN;
+
+        int pr = poll(&pfd, 1, 500); /* max 500ms wait, re-check running */
+        if (pr == 0) continue;       /* timeout */
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            perror("[RECEPTIONIST] poll triage FIFO");
+            continue;
+        }
+
+        if (!(pfd.revents & POLLIN)) continue;
+
         ssize_t n = read(fd, buf, sizeof(buf) - 1);
 
         if (n <= 0) {
-            /* n == 0: writer closed the FIFO (EOF). Reopen blocking fd. */
-            close(fd);
+            if (!running) break;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+
+            /* EOF or other error: reopen nonblocking fd */
+            if (fd != -1) close(fd);
             fd = -1;
             while (fd == -1 && running) {
-                fd = open_triage_fifo_read_block();
+                fd = open_triage_fifo_read();
                 if (fd == -1) sleep(1);
             }
+            if (!running) break;
             continue;
         }
 
         buf[n] = '\0';
+
+        // #region agent log (H4: FIFO read boundaries / partial lines)
+        DBG2("pre", "H4", "admissions.c:thread_receptionist:read", "triage_fifo_read",
+             "n", (long long)n, "has_nl", (long long)(strchr(buf, '\n') != NULL));
+        // #endregion
 
         /* Parse pipe-delimited triage line:
          * patient_id|name|age|severity|priority|care_units|arrival_time */
@@ -305,6 +331,11 @@ static void *thread_receptionist(void *arg) {
             printf("[RECEPTIONIST] Patient %d queued (priority %d, depth %d)\n",
                    p.patient_id, p.priority, depth);
             pthread_cond_signal(&patient_available);
+
+            // #region agent log (H4: parsed record sanity)
+            DBG2("pre", "H4", "admissions.c:thread_receptionist:enqueue", "triage_parsed",
+                 "patient_id", p.patient_id, "priority", p.priority);
+            // #endregion
         } else {
             /* PQ heap full (>100) — return the semaphore slot */
             fprintf(stderr,
@@ -317,6 +348,10 @@ static void *thread_receptionist(void *arg) {
 
     if (fd != -1) close(fd);
     printf("[RECEPTIONIST] Thread exiting.\n");
+
+    // #region agent log (H5: receptionist exit reached)
+    dbg_write_ndjson("pre", "H5", "admissions.c:thread_receptionist", "exit", "{}");
+    // #endregion
     return NULL;
 }
 
@@ -374,6 +409,12 @@ static void *thread_scheduler(void *arg) {
         while (bed_id == -1 && running) {
             printf("[SCHEDULER] No bed for patient %d — waiting on bed_freed.\n",
                    p.patient_id);
+
+            // #region agent log (H5: scheduler waiting for bed, possible stall)
+            DBG2("pre", "H5", "admissions.c:thread_scheduler:wait_bed", "no_bed_wait",
+                 "patient_id", p.patient_id, "care_units", p.care_units);
+            // #endregion
+
             pthread_cond_wait(&bed_freed, &bed_mutex);
             bed_id = ba_alloc(&g_allocator, p.care_units, req_type, p.patient_id);
         }
@@ -388,6 +429,11 @@ static void *thread_scheduler(void *arg) {
         /* ba_alloc() already set is_free=0. Set patient_id then unlock. */
         shm_ward[bed_id].patient_id = p.patient_id;
         pthread_mutex_unlock(&bed_mutex);
+
+        // #region agent log (H2: allocation choice vs care_units/type)
+        DBG2("pre", "H2", "admissions.c:thread_scheduler:alloc", "allocated_bed",
+             "patient_id", p.patient_id, "bed_id", bed_id);
+        // #endregion
 
         /* ── mmap record write (Task 5) ──────────────────────────────── */
         if (mmap_records) {
@@ -486,9 +532,19 @@ static void *thread_nurse(void *arg) {
                         printf("[%s] Patient %d not in range — parked in "
                                "lost_ids[] (count=%d)\n",
                                label, id, lost_ids_count);
+
+                        // #region agent log (H3: discharge event routing via lost_ids)
+                        DBG2("pre", "H3", "admissions.c:thread_nurse:park", "park_discharge_id",
+                             "patient_id", id, "lost_count", lost_ids_count);
+                        // #endregion
                     } else {
                         fprintf(stderr, "[%s] lost_ids[] full — patient %d "
                                 "discharge event dropped.\n", label, id);
+
+                        // #region agent log (H3: discharge event dropped due to buffer full)
+                        DBG1("pre", "H3", "admissions.c:thread_nurse:drop", "drop_discharge_id",
+                             "patient_id", id);
+                        // #endregion
                     }
                 }
             } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -521,6 +577,11 @@ static void *thread_nurse(void *arg) {
 
         printf("[%s] Discharging patient %d from bed %d.\n",
                label, discharged_id, freed_bed);
+
+        // #region agent log (H3/H1: discharge triggers free)
+        DBG2("pre", "H3", "admissions.c:thread_nurse:free", "free_bed",
+             "patient_id", discharged_id, "bed_id", freed_bed);
+        // #endregion
 
         /* ba_free() handles is_free=1, coalescing, ward map, frag report */
         ba_free(&g_allocator, freed_bed);
@@ -667,7 +728,7 @@ int main(int argc, char *argv[]) {
     /* Using O_RDWR on a FIFO is a POSIX trick: the fd is readable but the
      * process holds the write-end reference itself, so open() never blocks.
      * Nurse threads read patient_ids from this fd under discharge_mutex.  */
-    g_discharge_fd = open(FIFO_DISCHARGE_PATH, O_RDWR);
+    g_discharge_fd = open(FIFO_DISCHARGE_PATH, O_RDWR | O_NONBLOCK);
     if (g_discharge_fd == -1) {
         perror("[ADMISSIONS] open discharge FIFO");
         exit(1);
@@ -708,11 +769,49 @@ int main(int argc, char *argv[]) {
     /* Also unblock receptionist/nurse FIFO reads with a short post */
     sem_post(&sem_queue);
 
+    // #region agent log (H5: join order and where we stall)
+    dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_begin", "{}");
+    // #endregion
+
+    // #region agent log
+    dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_receptionist_begin", "{}");
+    // #endregion
     pthread_join(t_receptionist,    NULL);
+    // #region agent log
+    dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_receptionist_done", "{}");
+    // #endregion
+
+    // #region agent log
+    dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_scheduler_begin", "{}");
+    // #endregion
     pthread_join(t_scheduler,       NULL);
+    // #region agent log
+    dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_scheduler_done", "{}");
+    // #endregion
+
+    // #region agent log
+    dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_nurse_icu_begin", "{}");
+    // #endregion
     pthread_join(t_nurse_icu,       NULL);
+    // #region agent log
+    dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_nurse_icu_done", "{}");
+    // #endregion
+
+    // #region agent log
+    dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_nurse_isolation_begin", "{}");
+    // #endregion
     pthread_join(t_nurse_isolation, NULL);
+    // #region agent log
+    dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_nurse_isolation_done", "{}");
+    // #endregion
+
+    // #region agent log
+    dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_nurse_general_begin", "{}");
+    // #endregion
     pthread_join(t_nurse_general,   NULL);
+    // #region agent log
+    dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_nurse_general_done", "{}");
+    // #endregion
 
     /* ── Cleanup ────────────────────────────────────────────────────── */
     sem_destroy(&sem_icu);

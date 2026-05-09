@@ -15,6 +15,7 @@
 
 #include "bed_allocator.h"
 #include "types.h"
+#include "debug_log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -145,6 +146,16 @@ found:
     /* Mark partition occupied — physical bed, fixed size, no splitting */
     a->ward[idx].is_free = 0;
 
+    // #region agent log (H2: allocator picks fixed bed partition)
+    {
+        char data[256];
+        snprintf(data, sizeof(data),
+                 "{\"patient_id\":%d,\"care_units\":%d,\"idx\":%d,\"bed_size\":%d}",
+                 patient_id_hint, care_units, idx, a->ward[idx].size);
+        dbg_write_ndjson("pre", "H2", "bed_allocator.c:ba_alloc", "alloc_choice", data);
+    }
+    // #endregion
+
     /* ── Paging simulation ───────────────────────────────────────── */
     int pages_needed  = (care_units + PAGE_SIZE - 1) / PAGE_SIZE;
     int internal_frag = (pages_needed * PAGE_SIZE) - care_units;
@@ -168,6 +179,11 @@ void ba_free(BedAllocator *a, int partition_idx) {
 
     /* Re-insert into free list (sorted ascending by index) */
     fl_insert(a, partition_idx);
+
+    // #region agent log (H1: no coalescing, fragmentation computed from bed sizes)
+    DBG1("pre", "H1", "bed_allocator.c:ba_free", "freed_partition_idx",
+         "idx", partition_idx);
+    // #endregion
 
     ba_print_ward_map(a, "AFTER free");
     ba_fragmentation_report(a, g_mem_log);
