@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <limits.h>
 
 /* ── Module-level log file ───────────────────────────────────────────── */
 
@@ -65,10 +66,14 @@ void ba_init(BedAllocator *a, BedPartition *ward, int total, AllocStrategy s) {
     a->strategy  = s;
     a->free_list = NULL;
 
+    int free_count = 0;
+
     /* Build initial free_list from all free partitions */
     for (int i = 0; i < total; i++) {
-        if (ward[i].is_free && ward[i].size > 0)
+        if (ward[i].is_free && ward[i].size > 0) {
             fl_insert(a, i);
+            free_count++;
+        }
     }
 
     /* Open memory log — append mode so multiple runs accumulate */
@@ -79,7 +84,7 @@ void ba_init(BedAllocator *a, BedPartition *ward, int total, AllocStrategy s) {
     }
 
     printf("[ALLOC] Initialised with strategy: %s | %d partitions | %d free\n",
-           ba_strategy_name(s), total, total); /* all free at init */
+           ba_strategy_name(s), total, free_count);
 }
 
 /* ── ba_alloc ────────────────────────────────────────────────────────── */
@@ -90,7 +95,7 @@ int ba_alloc(BedAllocator *a, int care_units, const char *bed_type,
     FreeNode *chosen_prev = NULL;
 
     /* Sentinels for strategy selection */
-    int best_delta  =  1 << 30; /* BEST:  minimise surplus  */
+    int best_delta  =  INT_MAX; /* BEST:  minimise surplus  */
     int worst_delta = -1;       /* WORST: maximise surplus  */
 
     FreeNode *cur  = a->free_list;

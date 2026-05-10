@@ -52,7 +52,7 @@ static pthread_cond_t  bed_freed   = PTHREAD_COND_INITIALIZER;
 
 /* Protects g_wait_queue (PriorityQueue).
  * NOTE: NOT static — terminal_ui.c links to this symbol for queue depth. */
-pthread_mutex_t queue_mutex       = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t g_queue_mutex       = PTHREAD_MUTEX_INITIALIZER;
 /* Signalled by receptionist when a patient is pushed onto the queue */
 static pthread_cond_t  patient_available = PTHREAD_COND_INITIALIZER;
 
@@ -76,7 +76,7 @@ static pthread_mutex_t child_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /*
  * Lock ordering (always acquire in this order to prevent deadlock):
- *   1. queue_mutex       — protects g_wait_queue (priority queue)
+ *   1. g_queue_mutex       — protects g_wait_queue (priority queue)
  *   2. discharge_mutex   — protects shared discharge FIFO reads
  *   3. bed_mutex         — protects shm_ward[] bed bitmap
  * sem_icu / sem_isolation are acquired BEFORE bed_mutex in scheduler thread.
@@ -325,7 +325,7 @@ static void *thread_receptionist(void *arg) {
         /* Bounded producer: block if wait queue is at capacity (20 patients) */
         sem_wait(&sem_queue);
 
-        pthread_mutex_lock(&queue_mutex);
+        pthread_mutex_lock(&g_queue_mutex);
         if (pq_push(&g_wait_queue, p) == 0) {
             int depth = pq_size(&g_wait_queue);
             printf("[RECEPTIONIST] Patient %d queued (priority %d, depth %d)\n",
@@ -343,7 +343,7 @@ static void *thread_receptionist(void *arg) {
                     p.patient_id);
             sem_post(&sem_queue);
         }
-        pthread_mutex_unlock(&queue_mutex);
+        pthread_mutex_unlock(&g_queue_mutex);
     }
 
     if (fd != -1) close(fd);
@@ -363,19 +363,19 @@ static void *thread_scheduler(void *arg) {
 
     while (running) {
         /* Wait for a patient to appear in the queue */
-        pthread_mutex_lock(&queue_mutex);
+        pthread_mutex_lock(&g_queue_mutex);
         while (pq_is_empty(&g_wait_queue) && running) {
-            pthread_cond_wait(&patient_available, &queue_mutex);
+            pthread_cond_wait(&patient_available, &g_queue_mutex);
         }
 
         if (!running) {
-            pthread_mutex_unlock(&queue_mutex);
+            pthread_mutex_unlock(&g_queue_mutex);
             break;
         }
 
         PatientRecord p = pq_pop(&g_wait_queue);
         int depth       = pq_size(&g_wait_queue);
-        pthread_mutex_unlock(&queue_mutex);
+        pthread_mutex_unlock(&g_queue_mutex);
 
         /* Release one slot in the bounded semaphore (consumer side) */
         sem_post(&sem_queue);
@@ -610,20 +610,24 @@ static void *thread_nurse(void *arg) {
 int main(int argc, char *argv[]) {
     /* ── Parse --strategy best|first|worst ───────────────────────────── */
     AllocStrategy chosen_strategy = STRATEGY_BEST;
-    for (int i = 1; i < argc - 1; i++) {
+    for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--strategy") == 0) {
-            if      (strcmp(argv[i + 1], "first") == 0) {
-                chosen_strategy = STRATEGY_FIRST;
-                g_strategy_name = "first";
-            } else if (strcmp(argv[i + 1], "worst") == 0) {
-                chosen_strategy = STRATEGY_WORST;
-                g_strategy_name = "worst";
-            } else if (strcmp(argv[i + 1], "best") == 0) {
-                chosen_strategy = STRATEGY_BEST;
-                g_strategy_name = "best";
+            if (i + 1 < argc) {
+                if      (strcmp(argv[i + 1], "first") == 0) {
+                    chosen_strategy = STRATEGY_FIRST;
+                    g_strategy_name = "first";
+                } else if (strcmp(argv[i + 1], "worst") == 0) {
+                    chosen_strategy = STRATEGY_WORST;
+                    g_strategy_name = "worst";
+                } else if (strcmp(argv[i + 1], "best") == 0) {
+                    chosen_strategy = STRATEGY_BEST;
+                    g_strategy_name = "best";
+                } else {
+                    fprintf(stderr, "[ADMISSIONS] Unknown strategy '%s' — using 'best'.\n",
+                            argv[i + 1]);
+                }
             } else {
-                fprintf(stderr, "[ADMISSIONS] Unknown strategy '%s' — using 'best'.\n",
-                        argv[i + 1]);
+                fprintf(stderr, "[ADMISSIONS] Missing value for --strategy — using 'best'.\n");
             }
             break;
         }
@@ -758,9 +762,9 @@ int main(int argc, char *argv[]) {
     ui_stop();
 
     /* Wake threads that may be blocked in condvar waits */
-    pthread_mutex_lock(&queue_mutex);
+    pthread_mutex_lock(&g_queue_mutex);
     pthread_cond_broadcast(&patient_available);
-    pthread_mutex_unlock(&queue_mutex);
+    pthread_mutex_unlock(&g_queue_mutex);
 
     pthread_mutex_lock(&bed_mutex);
     pthread_cond_broadcast(&bed_freed);

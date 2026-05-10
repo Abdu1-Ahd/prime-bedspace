@@ -76,14 +76,21 @@ void ui_render(BedPartition *ward, int total) {
         printf("\n");
     }
 
-    /* Queue depth — read under queue_mutex */
-    int depth = 0;
-    if (pthread_mutex_trylock(&queue_mutex) == 0) {
-        depth = g_wait_queue.size;
-        pthread_mutex_unlock(&queue_mutex);
+    /* Queue depth — read under g_queue_mutex */
+    static int last_depth = 0;
+    int trylock_failed = 0;
+    if (pthread_mutex_trylock(&g_queue_mutex) == 0) {
+        last_depth = g_wait_queue.size;
+        pthread_mutex_unlock(&g_queue_mutex);
+    } else {
+        trylock_failed = 1;
     }
 
-    printf("\n  Waiting queue depth : %d\n", depth);
+    if (trylock_failed) {
+        printf("\n  Waiting queue depth : %d (stale)\n", last_depth);
+    } else {
+        printf("\n  Waiting queue depth : %d\n", last_depth);
+    }
     printf("  Strategy            : %s\n", g_ui_strategy);
     printf("\n  \033[2m[■] = occupied   [ ] = free\033[0m\n");
     fflush(stdout);
@@ -91,28 +98,34 @@ void ui_render(BedPartition *ward, int total) {
 
 /* ── ui_start ────────────────────────────────────────────────────────── */
 
+static int ui_started = 0;
+
 void ui_start(BedPartition *ward, int total, const char *strategy) {
+    if (ui_started) return;
+
     g_ui_ward     = ward;
     g_ui_total    = total;
     g_ui_strategy = strategy ? strategy : "best";
     ui_running    = 1;
 
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_create(&ui_thread, &attr, render_loop, NULL);
-    pthread_attr_destroy(&attr);
+    if (pthread_create(&ui_thread, NULL, render_loop, NULL) != 0) {
+        perror("[UI] pthread_create failed");
+        ui_running = 0;
+        return;
+    }
 
+    ui_started = 1;
     printf("[UI] Terminal renderer started (strategy=%s).\n", g_ui_strategy);
 }
 
 /* ── ui_stop ─────────────────────────────────────────────────────────── */
 
 void ui_stop(void) {
+    if (!ui_started) return;
     ui_running = 0;
-    /* Detached thread will exit on its next loop iteration.
-     * Sleep briefly so the render thread can clean up its current frame. */
-    usleep(1200000); /* 1.2s — slightly longer than the 1s render interval */
+    pthread_join(ui_thread, NULL);
+    ui_started = 0;
+    
     /* Restore cursor / clear any partial render line */
     printf("\033[2J\033[H");
     printf("[UI] Terminal renderer stopped.\n");

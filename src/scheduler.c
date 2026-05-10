@@ -108,11 +108,17 @@ int pq_peek_copy(PriorityQueue *pq, PatientRecord *out) {
 }
 
 int pq_is_empty(PriorityQueue *pq) {
-    return pq->size == 0;
+    pthread_mutex_lock(&pq->lock);
+    int empty = (pq->size == 0);
+    pthread_mutex_unlock(&pq->lock);
+    return empty;
 }
 
 int pq_size(PriorityQueue *pq) {
-    return pq->size;
+    pthread_mutex_lock(&pq->lock);
+    int size = pq->size;
+    pthread_mutex_unlock(&pq->lock);
+    return size;
 }
 
 /* ── Admission event logging ────────────────────────────────────────────── */
