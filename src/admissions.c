@@ -707,7 +707,7 @@ int main(int argc, char *argv[]) {
 
     pthread_mutex_destroy(&bed_mutex);
     pthread_cond_destroy(&bed_freed);
-    pthread_mutex_destroy(&queue_mutex);
+    pthread_mutex_destroy(&g_queue_mutex);
     pthread_cond_destroy(&patient_available);
     pthread_mutex_destroy(&child_mutex);
     pthread_mutex_destroy(&discharge_mutex);
