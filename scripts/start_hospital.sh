@@ -1,15 +1,13 @@
 #!/bin/bash
-# ==============================================================================
-# Project: Prime BedSpace
-# Script: start_hospital.sh
-# Group: Zawiar & Subhani
-# Members: Abdul Ahad Zawiar (Abdu1-Ahd), AbdulRahim Subhani (abdulrahim-subh)
-# Date: 2026-05-08
-# Purpose: Initializes the hospital simulation, sets up IPC components,
-#          and launches the main admissions manager.
-# Usage: ./start_hospital.sh
-# ==============================================================================
-
+# ============================================================
+# Project : Prime BedSpace - Hospital Patient Triage & Bed Allocator
+# Script  : start_hospital.sh
+# Group   : Group 14
+# Members : Abdul Ahad (24F-0727), Abdul Rahim (24F-0514)
+# Date    : 2026-05-12
+# Purpose : Initializes IPC resources, creates discharge FIFO, and launches the admissions manager process.
+# Usage   : bash scripts/start_hospital.sh
+# ============================================================
 if [ -f "/tmp/hospital.pid" ]; then
     PID=$(cat /tmp/hospital.pid)
     echo "[ERROR] Hospital already running. PID: $PID" >&2
@@ -21,17 +19,13 @@ if [ ! -f "./build/admissions" ]; then
     exit 1
 fi
 
-# Clean up any stale named semaphores from a previous crash
-# (Linux stores POSIX named semaphores in /dev/shm as sem.<name>)
 [ -e /dev/shm/sem.sem_icu_limit ]       && rm -f /dev/shm/sem.sem_icu_limit       && echo "[INIT] Removed stale /sem_icu_limit"
 [ -e /dev/shm/sem.sem_isolation_limit ] && rm -f /dev/shm/sem.sem_isolation_limit  && echo "[INIT] Removed stale /sem_isolation_limit"
 
-# FIFOs are now created by admissions.c itself (mkfifo with EEXIST ignore).
-# Pre-create here too so they exist before admissions opens them.
 [ -p "/tmp/discharge_fifo" ] || mkfifo /tmp/discharge_fifo && echo "[INIT] discharge_fifo ready"
 [ -p "/tmp/triage_fifo" ]    || mkfifo /tmp/triage_fifo    && echo "[INIT] triage_fifo ready"
 
-STRATEGY="${1:-best}"   # default best; override: ./start_hospital.sh first
+STRATEGY="${1:-best}"
 ./build/admissions --strategy "$STRATEGY" &
 PID=$!
 echo $PID > /tmp/hospital.pid

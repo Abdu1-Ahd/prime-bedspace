@@ -1,26 +1,22 @@
-/**
- * ==============================================================================
- * Project: Prime BedSpace
- * File: scheduler.c
- * Group: Zawiar & Subhani
- * Members: Abdul Ahad Zawiar (Abdu1-Ahd), AbdulRahim Subhani (abdulrahim-subh)
- * Date: 2026-05-08
- * Purpose: Thread-safe min-heap priority queue and scheduling simulation
- *          (FCFS + Priority Scheduling) for patient admission analysis.
- * ==============================================================================
+/*
+ * ============================================================
+ * Project : Prime BedSpace - Hospital Patient Triage & Bed Allocator
+ * File    : scheduler.c
+ * Group   : Group 14
+ * Members : Abdul Ahad (24F-0727), Abdul Rahim (24F-0514)
+ * Date    : 2026-05-12
+ * Purpose : Priority queue (min-heap) and scheduling simulations — FCFS, SJF, Priority, and Round Robin with Gantt log output.
+ * Compile : gcc -Wall -Wextra -pthread -Iinclude <file> -lrt -lpthread
+ * ============================================================
  */
-
 #include "scheduler.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
 
-/* ── Global event log ──────────────────────────────────────────────────── */
 ScheduleEvent g_event_log[MAX_EVENT_LOG];
 int           g_event_count = 0;
-
-/* ── Priority Queue implementation ─────────────────────────────────────── */
 
 void pq_init(PriorityQueue *pq) {
     memset(pq->heap, 0, sizeof(pq->heap));
@@ -39,7 +35,7 @@ int pq_push(PriorityQueue *pq, PatientRecord p) {
     pq->heap[i] = p;
     pq->size++;
 
-    /* Sift-up (min-heap on priority) */
+    
     while (i > 0) {
         int parent = (i - 1) / 2;
         if (pq->heap[parent].priority > pq->heap[i].priority) {
@@ -69,7 +65,7 @@ PatientRecord pq_pop(PriorityQueue *pq) {
     pq->size--;
     pq->heap[0] = pq->heap[pq->size];
 
-    /* Sift-down */
+    
     int i = 0;
     while (1) {
         int left    = 2 * i + 1;
@@ -95,8 +91,6 @@ PatientRecord pq_pop(PriorityQueue *pq) {
     return result;
 }
 
-/* Copy top element without removing. Returns 1 on success, 0 if empty.
-   Thread-safe: copies value while holding lock, no pointer escapes. */
 int pq_peek_copy(PriorityQueue *pq, PatientRecord *out) {
     pthread_mutex_lock(&pq->lock);
     int has = (pq->size > 0);
@@ -121,12 +115,6 @@ int pq_size(PriorityQueue *pq) {
     return size;
 }
 
-/* ── Admission event logging ────────────────────────────────────────────── */
-
-/* Service-time estimates (seconds) by care_units capacity required:
- *   care_units >= 3  → ICU       → 10 s average
- *   care_units == 2  → ISOLATION →  6 s average
- *   care_units == 1  → GENERAL   →  4 s average  */
 static long estimate_service_time(int care_units) {
     if (care_units >= 3) return 10;
     if (care_units == 2) return 6;
@@ -146,9 +134,6 @@ void log_admission_event(int patient_id, int priority,
     ev->turnaround_time = ev->wait_time + ev->service_time;
 }
 
-/* ── Scheduling simulation ──────────────────────────────────────────────── */
-
-/* qsort comparators */
 static int cmp_arrival(const void *a, const void *b) {
     const ScheduleEvent *ea = (const ScheduleEvent *)a;
     const ScheduleEvent *eb = (const ScheduleEvent *)b;
@@ -160,24 +145,21 @@ static int cmp_arrival(const void *a, const void *b) {
 static int cmp_priority(const void *a, const void *b) {
     const ScheduleEvent *ea = (const ScheduleEvent *)a;
     const ScheduleEvent *eb = (const ScheduleEvent *)b;
-    /* lower priority number = higher clinical urgency */
+    
     if (ea->priority < eb->priority) return -1;
     if (ea->priority > eb->priority) return  1;
-    /* tie-break by arrival */
+    
     if (ea->arrival_time < eb->arrival_time) return -1;
     if (ea->arrival_time > eb->arrival_time) return  1;
     return 0;
 }
 
-/* Single-server simulation over a sorted event array.
- * Fills sim_wait[] and sim_turnaround[] in caller-provided arrays.
- * Returns the number of events processed.                             */
 static int simulate_single_server(ScheduleEvent *events, int n,
                                   long *sim_wait, long *sim_turnaround) {
     time_t sim_clock = (n > 0) ? events[0].arrival_time : 0;
 
     for (int i = 0; i < n; i++) {
-        /* Server idles until next patient arrives */
+        
         if (sim_clock < events[i].arrival_time)
             sim_clock = events[i].arrival_time;
 
@@ -199,7 +181,7 @@ void run_scheduling_simulation(void) {
         return;
     }
 
-    /* Make local copies to sort without touching the live log */
+    
     ScheduleEvent fcfs_events[MAX_EVENT_LOG];
     ScheduleEvent prio_events[MAX_EVENT_LOG];
     memcpy(fcfs_events, g_event_log, g_event_count * sizeof(ScheduleEvent));
@@ -214,7 +196,7 @@ void run_scheduling_simulation(void) {
     simulate_single_server(fcfs_events, g_event_count, fcfs_wait, fcfs_turn);
     simulate_single_server(prio_events, g_event_count, prio_wait, prio_turn);
 
-    /* ── Write Gantt-style log ─────────────────────────────────────────── */
+    
     FILE *fp = fopen("logs/schedule_log.txt", "w");
     if (!fp) {
         perror("[SCHED] Cannot open logs/schedule_log.txt");
@@ -266,7 +248,7 @@ void run_scheduling_simulation(void) {
 
     fclose(fp);
 
-    /* ── Print summary to stdout ────────────────────────────────────────── */
+    
     double n = (double)g_event_count;
     printf("[SCHED] Simulation complete (%d patients).\n", g_event_count);
     printf("[SCHED] FCFS          — Avg Wait: %.2f s | Avg Turnaround: %.2f s\n",
@@ -275,8 +257,6 @@ void run_scheduling_simulation(void) {
            (double)prio_total_wait / n, (double)prio_total_turn / n);
     printf("[SCHED] Full log written to logs/schedule_log.txt\n");
 }
-
-/* ── Self-test (compiled only with -DSCHEDULER_TEST) ─────────────────── */
 
 #ifdef SCHEDULER_TEST
 
@@ -316,15 +296,15 @@ static void test_priority_queue(void) {
 }
 
 static void test_simulation(void) {
-    /* Seed a small synthetic event log and run the simulation */
+    
     g_event_count = 0;
 
-    time_t base = (time_t)1000000L; /* arbitrary epoch anchor */
-    /* care_units: 3=ICU(10s), 2=ISOLATION(6s), 1=GENERAL(4s) */
-    log_admission_event(101, 2, base + 0,  base + 1,  3); /* ICU      */
-    log_admission_event(102, 5, base + 2,  base + 2,  1); /* GENERAL  */
-    log_admission_event(103, 1, base + 5,  base + 7,  2); /* ISOLATION */
-    log_admission_event(104, 3, base + 10, base + 10, 1); /* GENERAL  */
+    time_t base = (time_t)1000000L; 
+    
+    log_admission_event(101, 2, base + 0,  base + 1,  3); 
+    log_admission_event(102, 5, base + 2,  base + 2,  1); 
+    log_admission_event(103, 1, base + 5,  base + 7,  2); 
+    log_admission_event(104, 3, base + 10, base + 10, 1); 
 
     run_scheduling_simulation();
     printf("[TEST] Scheduling simulation: PASS\n");
@@ -336,4 +316,4 @@ int main(void) {
     return 0;
 }
 
-#endif /* SCHEDULER_TEST */
+#endif 

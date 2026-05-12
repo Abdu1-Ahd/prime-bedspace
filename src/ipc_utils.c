@@ -1,14 +1,14 @@
-/**
- * ==============================================================================
- * Project: Prime BedSpace
- * File: ipc_utils.c
- * Group: Zawiar & Subhani
- * Members: Abdul Ahad Zawiar (Abdu1-Ahd), AbdulRahim Subhani (abdulrahim-subh)
- * Date: 2026-05-08
- * Purpose: POSIX IPC utilities — System V shared memory and named FIFO helpers.
- * ==============================================================================
+/*
+ * ============================================================
+ * Project : Prime BedSpace - Hospital Patient Triage & Bed Allocator
+ * File    : ipc_utils.c
+ * Group   : Group 14
+ * Members : Abdul Ahad (24F-0727), Abdul Rahim (24F-0514)
+ * Date    : 2026-05-12
+ * Purpose : IPC utilities — shared memory init/detach and non-blocking FIFO open helpers.
+ * Compile : gcc -Wall -Wextra -pthread -Iinclude <file> -lrt -lpthread
+ * ============================================================
  */
-
 #include "types.h"
 #include "ipc.h"
 #include <stdio.h>
@@ -17,8 +17,6 @@
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <sys/stat.h>
-
-/* ── Shared Memory ───────────────────────────────────────────────────── */
 
 void *init_shared_memory(void) {
     int shmid = shmget((key_t)SHM_KEY,
@@ -43,9 +41,6 @@ void detach_shared_memory(void *ptr) {
     }
 }
 
-/* ── FIFO helpers ────────────────────────────────────────────────────── */
-
-/* Open FIFO for blocking read. Returns fd or -1. */
 int open_discharge_fifo_read(void) {
     int fd = open(FIFO_DISCHARGE_PATH, O_RDONLY | O_NONBLOCK);
     if (fd == -1 && errno != ENXIO && errno != ENOENT) {
@@ -54,7 +49,6 @@ int open_discharge_fifo_read(void) {
     return fd;
 }
 
-/* Open FIFO for non-blocking write. Returns fd or -1. */
 int open_discharge_fifo_write(void) {
     int fd = open(FIFO_DISCHARGE_PATH, O_WRONLY | O_NONBLOCK);
     if (fd == -1 && errno != ENXIO && errno != ENOENT) {
@@ -63,8 +57,6 @@ int open_discharge_fifo_write(void) {
     return fd;
 }
 
-/* Open triage FIFO for non-blocking read. Returns fd or -1.
- * Use for retry loops where the FIFO may not exist yet. */
 int open_triage_fifo_read(void) {
     int fd = open(FIFO_TRIAGE_PATH, O_RDONLY | O_NONBLOCK);
     if (fd == -1 && errno != ENXIO && errno != ENOENT) {
@@ -73,18 +65,14 @@ int open_triage_fifo_read(void) {
     return fd;
 }
 
-/* Open triage FIFO for BLOCKING read (no O_NONBLOCK).
- * Used by the receptionist thread after the FIFO is confirmed to exist.
- * read() on this fd will block until data arrives — no busy-spin needed. */
 int open_triage_fifo_read_block(void) {
-    int fd = open(FIFO_TRIAGE_PATH, O_RDONLY); /* blocking */
+    int fd = open(FIFO_TRIAGE_PATH, O_RDONLY); 
     if (fd == -1) {
         perror("[IPC] open triage FIFO read (blocking)");
     }
     return fd;
 }
 
-/* Open triage FIFO for non-blocking write. Returns fd or -1. */
 int open_triage_fifo_write(void) {
     int fd = open(FIFO_TRIAGE_PATH, O_WRONLY | O_NONBLOCK);
     if (fd == -1 && errno != ENXIO && errno != ENOENT) {

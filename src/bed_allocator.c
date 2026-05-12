@@ -1,18 +1,14 @@
-/**
- * ==============================================================================
- * Project: Prime BedSpace
- * File: bed_allocator.c
- * Group: Zawiar & Subhani
- * Members: Abdul Ahad Zawiar (Abdu1-Ahd), AbdulRahim Subhani (abdulrahim-subh)
- * Date: 2026-05-08
- * Purpose: Phase 4 — Memory management simulation.
- *          Implements a free-list allocator over shm_ward[] with three
- *          placement strategies (Best-Fit, First-Fit, Worst-Fit), left+right
- *          coalescing, external fragmentation reporting, and a simple paging
- *          simulation that computes internal fragmentation per admission.
- * ==============================================================================
+/*
+ * ============================================================
+ * Project : Prime BedSpace - Hospital Patient Triage & Bed Allocator
+ * File    : bed_allocator.c
+ * Group   : Group 14
+ * Members : Abdul Ahad (24F-0727), Abdul Rahim (24F-0514)
+ * Date    : 2026-05-12
+ * Purpose : Memory allocator — implements Best-Fit, First-Fit, and Worst-Fit strategies with coalescing and fragmentation reporting.
+ * Compile : gcc -Wall -Wextra -pthread -Iinclude <file> -lrt -lpthread
+ * ============================================================
  */
-
 #include "bed_allocator.h"
 #include "types.h"
 #include "debug_log.h"
@@ -22,13 +18,8 @@
 #include <time.h>
 #include <limits.h>
 
-/* ── Module-level log file ───────────────────────────────────────────── */
-
 static FILE *g_mem_log = NULL;
 
-/* ── Free-list helpers ───────────────────────────────────────────────── */
-
-/* Allocate a new FreeNode on the heap. Exits on OOM. */
 static FreeNode *node_new(int idx) {
     FreeNode *n = (FreeNode *)malloc(sizeof(FreeNode));
     if (!n) {
@@ -40,7 +31,6 @@ static FreeNode *node_new(int idx) {
     return n;
 }
 
-/* Insert node for idx into free_list, maintaining ascending order by idx. */
 static void fl_insert(BedAllocator *a, int idx) {
     FreeNode *n = node_new(idx);
 
@@ -57,9 +47,6 @@ static void fl_insert(BedAllocator *a, int idx) {
     cur->next = n;
 }
 
-
-/* ── ba_init ─────────────────────────────────────────────────────────── */
-
 void ba_init(BedAllocator *a, BedPartition *ward, int total, AllocStrategy s) {
     a->ward      = ward;
     a->total     = total;
@@ -68,7 +55,7 @@ void ba_init(BedAllocator *a, BedPartition *ward, int total, AllocStrategy s) {
 
     int free_count = 0;
 
-    /* Build initial free_list from all free partitions */
+    
     for (int i = 0; i < total; i++) {
         if (ward[i].is_free && ward[i].size > 0) {
             fl_insert(a, i);
@@ -76,7 +63,7 @@ void ba_init(BedAllocator *a, BedPartition *ward, int total, AllocStrategy s) {
         }
     }
 
-    /* Open memory log — append mode so multiple runs accumulate */
+    
     if (!g_mem_log) {
         g_mem_log = fopen("logs/memory_log.txt", "a");
         if (!g_mem_log)
@@ -87,16 +74,14 @@ void ba_init(BedAllocator *a, BedPartition *ward, int total, AllocStrategy s) {
            ba_strategy_name(s), total, free_count);
 }
 
-/* ── ba_alloc ────────────────────────────────────────────────────────── */
-
 int ba_alloc(BedAllocator *a, int care_units, const char *bed_type,
              int patient_id_hint) {
     FreeNode *chosen      = NULL;
     FreeNode *chosen_prev = NULL;
 
-    /* Sentinels for strategy selection */
-    int best_delta  =  INT_MAX; /* BEST:  minimise surplus  */
-    int worst_delta = -1;       /* WORST: maximise surplus  */
+    
+    int best_delta  =  INT_MAX; 
+    int worst_delta = -1;       
 
     FreeNode *cur  = a->free_list;
     FreeNode *prev = NULL;
@@ -104,7 +89,7 @@ int ba_alloc(BedAllocator *a, int care_units, const char *bed_type,
     while (cur) {
         int idx = cur->partition_idx;
 
-        /* Only consider partitions matching the requested bed type */
+        
         if (a->ward[idx].size >= care_units &&
             strcmp(a->ward[idx].bed_type, bed_type) == 0) {
 
@@ -112,7 +97,7 @@ int ba_alloc(BedAllocator *a, int care_units, const char *bed_type,
 
             switch (a->strategy) {
                 case STRATEGY_FIRST:
-                    /* First-Fit: take the very first match */
+                    
                     chosen      = cur;
                     chosen_prev = prev;
                     goto found;
@@ -139,19 +124,18 @@ int ba_alloc(BedAllocator *a, int care_units, const char *bed_type,
     }
 
 found:
-    if (!chosen) return -1; /* no fit */
+    if (!chosen) return -1; 
 
     int idx = chosen->partition_idx;
 
-    /* Remove from free_list */
+    
     if (chosen_prev) chosen_prev->next = chosen->next;
     else              a->free_list      = chosen->next;
     free(chosen);
 
-    /* Mark partition occupied — physical bed, fixed size, no splitting */
+    
     a->ward[idx].is_free = 0;
 
-    // #region agent log (H2: allocator picks fixed bed partition)
     {
         char data[256];
         snprintf(data, sizeof(data),
@@ -159,9 +143,8 @@ found:
                  patient_id_hint, care_units, idx, a->ward[idx].size);
         dbg_write_ndjson("pre", "H2", "bed_allocator.c:ba_alloc", "alloc_choice", data);
     }
-    // #endregion
 
-    /* ── Paging simulation ───────────────────────────────────────── */
+    
     int pages_needed  = (care_units + PAGE_SIZE - 1) / PAGE_SIZE;
     int internal_frag = (pages_needed * PAGE_SIZE) - care_units;
     printf("[PAGING] Patient %d: %d care units → %d pages, "
@@ -171,35 +154,29 @@ found:
     return idx;
 }
 
-/* ── ba_free ─────────────────────────────────────────────────────────── */
-
 void ba_free(BedAllocator *a, int partition_idx) {
     if (partition_idx < 0 || partition_idx >= a->total) return;
 
     ba_print_ward_map(a, "BEFORE free");
 
-    /* Mark bed free — physical beds are fixed partitions, never absorbed */
+    
     a->ward[partition_idx].is_free    = 1;
     a->ward[partition_idx].patient_id = -1;
 
-    /* Re-insert into free list (sorted ascending by index) */
+    
     fl_insert(a, partition_idx);
 
-    // #region agent log (H1: no coalescing, fragmentation computed from bed sizes)
     DBG1("pre", "H1", "bed_allocator.c:ba_free", "freed_partition_idx",
          "idx", partition_idx);
-    // #endregion
 
     ba_print_ward_map(a, "AFTER free");
     ba_fragmentation_report(a, g_mem_log);
 }
 
-/* ── ba_print_ward_map ───────────────────────────────────────────────── */
-
 void ba_print_ward_map(BedAllocator *a, const char *label) {
     printf("[MAP %s] ", label);
     for (int i = 0; i < a->total; i++) {
-        if (a->ward[i].size == 0) continue; /* absorbed slot — skip */
+        if (a->ward[i].size == 0) continue; 
         const char *type = a->ward[i].bed_type;
         const char *abbr;
 
@@ -211,8 +188,6 @@ void ba_print_ward_map(BedAllocator *a, const char *label) {
     }
     printf("\n");
 }
-
-/* ── ba_fragmentation_report ─────────────────────────────────────────── */
 
 void ba_fragmentation_report(BedAllocator *a, FILE *log) {
     int total_free   = 0;
@@ -246,8 +221,6 @@ void ba_fragmentation_report(BedAllocator *a, FILE *log) {
         fflush(log);
     }
 }
-
-/* ── ba_strategy_name ────────────────────────────────────────────────── */
 
 const char *ba_strategy_name(AllocStrategy s) {
     switch (s) {

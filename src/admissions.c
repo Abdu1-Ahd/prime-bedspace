@@ -1,27 +1,14 @@
-/**
- * ==============================================================================
- * Project: Prime BedSpace
- * File: admissions.c
- * Group: Zawiar & Subhani
- * Members: Abdul Ahad Zawiar (Abdu1-Ahd), AbdulRahim Subhani (abdulrahim-subh)
- * Date: 2026-05-08
- * Purpose: Phase 3+4 — Multi-threaded hospital admissions manager.
- *          Thread architecture:
- *            - Receptionist Thread: reads triage FIFO (blocking) → pushes
- *              PatientRecord onto priority queue, signals patient_available.
- *              Blocked by sem_queue (bounded, MAX_WAIT_QUEUE=20) when full.
- *            - Scheduler Thread: waits on patient_available → ba_alloc() under
- *              bed_mutex → waits on bed_freed if no bed free → fork/exec.
- *            - Nurse Thread Pool (3 threads, one per bed type):
- *              reads discharge FIFO (shared fd + discharge_mutex) → ba_free()
- *              → sem_post → broadcast bed_freed.
- * Phase 4 adds: BedAllocator (best/first/worst), paging simulation,
- *              mmap patient record log, ANSI terminal UI.
- * Compile: make all
- * Usage: ./build/admissions [--strategy best|first|worst]
- * ==============================================================================
+/*
+ * ============================================================
+ * Project : Prime BedSpace - Hospital Patient Triage & Bed Allocator
+ * File    : admissions.c
+ * Group   : Group 14
+ * Members : Abdul Ahad (24F-0727), Abdul Rahim (24F-0514)
+ * Date    : 2026-05-12
+ * Purpose : Central process manager — handles fork/exec, SIGCHLD, shared memory, IPC, scheduling triggers, and bed admission logic.
+ * Compile : gcc -Wall -Wextra -pthread -Iinclude <file> -lrt -lpthread
+ * ============================================================
  */
-
 #include "types.h"
 #include "ipc.h"
 #include "scheduler.h"
@@ -40,74 +27,44 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include <errno.h>
-#include <sys/stat.h>   /* mkfifo() */
+#include <sys/stat.h>   
 #include <poll.h>
 
-/* ── Synchronization primitives ─────────────────────────────────────── */
-
-/* Protects all reads/writes to shm_ward[] */
 static pthread_mutex_t bed_mutex   = PTHREAD_MUTEX_INITIALIZER;
-/* Broadcast by nurse threads when a bed is freed */
+
 static pthread_cond_t  bed_freed   = PTHREAD_COND_INITIALIZER;
 
-/* Protects g_wait_queue (PriorityQueue).
- * NOTE: NOT static — terminal_ui.c links to this symbol for queue depth. */
 pthread_mutex_t g_queue_mutex       = PTHREAD_MUTEX_INITIALIZER;
-/* Signalled by receptionist when a patient is pushed onto the queue */
+
 static pthread_cond_t  patient_available = PTHREAD_COND_INITIALIZER;
 
-/* Counting semaphores — limit concurrent admissions per ward type */
-static sem_t sem_icu;        /* max ICU_CAPACITY = 4       */
-static sem_t sem_isolation;  /* max ISOLATION_CAPACITY = 4 */
+static sem_t sem_icu;        
+static sem_t sem_isolation;  
 
-/* Bounded semaphore — producer (receptionist) blocks when 20 waiting */
-static sem_t sem_queue;      /* max MAX_WAIT_QUEUE = 20    */
+static sem_t sem_queue;      
 
-/* ── Globals ─────────────────────────────────────────────────────────── */
-
-PriorityQueue g_wait_queue;   /* NOT static — linked by terminal_ui.c */
+PriorityQueue g_wait_queue;   
 static BedPartition *shm_ward   = NULL;
 static volatile sig_atomic_t running = 1;
 
-/* Child process registry for SIGCHLD reaping */
 static pid_t child_pids[50];
 static int   child_count = 0;
 static pthread_mutex_t child_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/*
- * Lock ordering (always acquire in this order to prevent deadlock):
- *   1. g_queue_mutex       — protects g_wait_queue (priority queue)
- *   2. discharge_mutex   — protects shared discharge FIFO reads
- *   3. bed_mutex         — protects shm_ward[] bed bitmap
- * sem_icu / sem_isolation are acquired BEFORE bed_mutex in scheduler thread.
- * sem_queue is posted/waited outside all mutexes.
- * Never hold bed_mutex when calling fork().
- */
 static pthread_mutex_t discharge_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* Shared discharge fd — opened once in main(), read by all nurse threads
- * under discharge_mutex. If a patient_id does not belong to a nurse's range,
- * it is stored in lost_ids[] for another nurse to reclaim on its next pass. */
 static int g_discharge_fd = -1;
 
-/* Round-robin fallback buffer: up to 3 pending IDs not yet claimed by a nurse */
 #define LOST_IDS_MAX 3
 static int  lost_ids[LOST_IDS_MAX];
 static int  lost_ids_count = 0;
 
-/* ── Phase 4 globals ─────────────────────────────────────────────────── */
-
-/* Bed allocator — wraps shm_ward[] with free-list + strategy selection */
 static BedAllocator g_allocator;
 
-/* mmap patient record log (MAX_PATIENTS slots, msync'd on shutdown) */
 static PatientRecord *mmap_records = NULL;
 static pthread_mutex_t mmap_mutex  = PTHREAD_MUTEX_INITIALIZER;
 
-/* Active strategy name (set from --strategy argv, displayed in terminal UI) */
 static const char *g_strategy_name = "best";
-
-/* ── Signal handlers ─────────────────────────────────────────────────── */
 
 static void sigchld_handler(int sig) {
     (void)sig;
@@ -130,42 +87,26 @@ static void sigchld_handler(int sig) {
 static void sigterm_handler(int sig) {
     (void)sig;
     running = 0;
-    /* Wake all waiting threads so they can observe running=0 and exit */
+    
     pthread_cond_broadcast(&patient_available);
     pthread_cond_broadcast(&bed_freed);
 
-    // #region agent log (H5: shutdown path reached)
     dbg_write_ndjson("pre", "H5", "admissions.c:sigterm_handler", "sigterm_received",
                      "{\"running\":0}");
-    // #endregion
 }
 
-/* ── Internal helpers ────────────────────────────────────────────────── */
-
-/* Determine bed_type string from care_units.
- * Matches the same logic used during ward initialisation. */
 static const char *bed_type_for(int care_units) {
     if (care_units >= 3) return "ICU";
     if (care_units == 2) return "ISOLATION";
     return "GENERAL";
 }
 
-/* Fork and exec patient_simulator for patient p in bed_id.
- *
- * PRECONDITION: bed_mutex must NOT be held by the caller.
- * The caller (thread_scheduler) marks shm_ward[bed_id] as OCCUPIED and
- * unlocks bed_mutex BEFORE calling this function, ensuring fork() is
- * never called with any mutex held (prevents child inheriting locked state).
- *
- * On fork failure: re-acquires bed_mutex, reverts bed to free, broadcasts
- * bed_freed so the scheduler thread can retry with the next patient.
- */
 static void do_admit_to_bed(PatientRecord *p, int bed_id) {
     pthread_mutex_lock(&child_mutex);
     if (child_count >= 50) {
         fprintf(stderr, "[ADMISSIONS] child_pids table full — cannot fork.\n");
         pthread_mutex_unlock(&child_mutex);
-        /* Revert: re-acquire bed_mutex, reset bed, broadcast */
+        
         pthread_mutex_lock(&bed_mutex);
         shm_ward[bed_id].is_free    = 1;
         shm_ward[bed_id].patient_id = -1;
@@ -175,19 +116,19 @@ static void do_admit_to_bed(PatientRecord *p, int bed_id) {
     }
     pthread_mutex_unlock(&child_mutex);
 
-    /* Snapshot bed_type before fork (read-only after marking; safe without lock) */
+    
     char bed_type_snap[16];
     strncpy(bed_type_snap, shm_ward[bed_id].bed_type, sizeof(bed_type_snap) - 1);
     bed_type_snap[sizeof(bed_type_snap) - 1] = '\0';
 
     time_t admit_time = time(NULL);
 
-    /* ── fork() — NO mutex held ────────────────────────────────────── */
+    
     pid_t pid = fork();
 
     if (pid < 0) {
         perror("[ADMISSIONS] fork failed");
-        /* Revert bed under bed_mutex, wake scheduler */
+        
         pthread_mutex_lock(&bed_mutex);
         shm_ward[bed_id].is_free    = 1;
         shm_ward[bed_id].patient_id = -1;
@@ -197,7 +138,7 @@ static void do_admit_to_bed(PatientRecord *p, int bed_id) {
     }
 
     if (pid == 0) {
-        /* Child: exec patient_simulator */
+        
         char patient_id_str[32], triage_str[32], bed_id_str[32];
         snprintf(patient_id_str, sizeof(patient_id_str), "%d", p->patient_id);
         snprintf(triage_str,     sizeof(triage_str),     "%d", p->priority);
@@ -216,7 +157,7 @@ static void do_admit_to_bed(PatientRecord *p, int bed_id) {
         _exit(1);
     }
 
-    /* Parent */
+    
     pthread_mutex_lock(&child_mutex);
     child_pids[child_count++] = pid;
     pthread_mutex_unlock(&child_mutex);
@@ -228,22 +169,17 @@ static void do_admit_to_bed(PatientRecord *p, int bed_id) {
                         p->arrival_time, admit_time, p->care_units);
 }
 
-/* ── Thread: Receptionist ────────────────────────────────────────────── */
-
 static void *thread_receptionist(void *arg) {
     (void)arg;
     printf("[RECEPTIONIST] Thread started. Waiting for triage FIFO: %s\n",
            FIFO_TRIAGE_PATH);
 
-    // #region agent log (H5: receptionist lifecycle)
     dbg_write_ndjson("pre", "H5", "admissions.c:thread_receptionist", "start", "{}");
-    // #endregion
 
     int fd = -1;
-    /* Open triage FIFO in NONBLOCK mode and wait via poll().
-     * This avoids getting stuck in a blocking open/read during shutdown. */
+    
     while (fd == -1 && running) {
-        fd = open_triage_fifo_read(); /* O_RDONLY|O_NONBLOCK */
+        fd = open_triage_fifo_read(); 
         if (fd == -1) sleep(1);
     }
 
@@ -254,8 +190,8 @@ static void *thread_receptionist(void *arg) {
         pfd.fd     = fd;
         pfd.events = POLLIN;
 
-        int pr = poll(&pfd, 1, 500); /* max 500ms wait, re-check running */
-        if (pr == 0) continue;       /* timeout */
+        int pr = poll(&pfd, 1, 500); 
+        if (pr == 0) continue;       
         if (pr < 0) {
             if (errno == EINTR) continue;
             perror("[RECEPTIONIST] poll triage FIFO");
@@ -270,7 +206,7 @@ static void *thread_receptionist(void *arg) {
             if (!running) break;
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
 
-            /* EOF or other error: reopen nonblocking fd */
+            
             if (fd != -1) close(fd);
             fd = -1;
             while (fd == -1 && running) {
@@ -283,13 +219,10 @@ static void *thread_receptionist(void *arg) {
 
         buf[n] = '\0';
 
-        // #region agent log (H4: FIFO read boundaries / partial lines)
         DBG2("pre", "H4", "admissions.c:thread_receptionist:read", "triage_fifo_read",
              "n", (long long)n, "has_nl", (long long)(strchr(buf, '\n') != NULL));
-        // #endregion
 
-        /* Parse pipe-delimited triage line:
-         * patient_id|name|age|severity|priority|care_units|arrival_time */
+        
         PatientRecord p;
         memset(&p, 0, sizeof(p));
 
@@ -322,7 +255,7 @@ static void *thread_receptionist(void *arg) {
 
         if (p.patient_id <= 0 || p.priority < 1 || p.priority > 5) continue;
 
-        /* Bounded producer: block if wait queue is at capacity (20 patients) */
+        
         sem_wait(&sem_queue);
 
         pthread_mutex_lock(&g_queue_mutex);
@@ -332,12 +265,10 @@ static void *thread_receptionist(void *arg) {
                    p.patient_id, p.priority, depth);
             pthread_cond_signal(&patient_available);
 
-            // #region agent log (H4: parsed record sanity)
             DBG2("pre", "H4", "admissions.c:thread_receptionist:enqueue", "triage_parsed",
                  "patient_id", p.patient_id, "priority", p.priority);
-            // #endregion
         } else {
-            /* PQ heap full (>100) — return the semaphore slot */
+            
             fprintf(stderr,
                     "[RECEPTIONIST] PQ full — patient %d dropped.\n",
                     p.patient_id);
@@ -349,20 +280,16 @@ static void *thread_receptionist(void *arg) {
     if (fd != -1) close(fd);
     printf("[RECEPTIONIST] Thread exiting.\n");
 
-    // #region agent log (H5: receptionist exit reached)
     dbg_write_ndjson("pre", "H5", "admissions.c:thread_receptionist", "exit", "{}");
-    // #endregion
     return NULL;
 }
-
-/* ── Thread: Scheduler ──────────────────────────────────────────────── */
 
 static void *thread_scheduler(void *arg) {
     (void)arg;
     printf("[SCHEDULER] Thread started.\n");
 
     while (running) {
-        /* Wait for a patient to appear in the queue */
+        
         pthread_mutex_lock(&g_queue_mutex);
         while (pq_is_empty(&g_wait_queue) && running) {
             pthread_cond_wait(&patient_available, &g_queue_mutex);
@@ -377,43 +304,40 @@ static void *thread_scheduler(void *arg) {
         int depth       = pq_size(&g_wait_queue);
         pthread_mutex_unlock(&g_queue_mutex);
 
-        /* Release one slot in the bounded semaphore (consumer side) */
+        
         sem_post(&sem_queue);
 
         printf("[SCHEDULER] Dequeued patient %d (priority %d). "
                "Waiting patients: %d\n",
                p.patient_id, p.priority, depth);
 
-        /* Acquire ward-type semaphore BEFORE locking bed_mutex to avoid
-           inversion: semaphore controls capacity, mutex protects state. */
+        
         if (p.care_units >= 3) {
-            /* ICU patient — wait for an ICU slot */
+            
             printf("[SCHEDULER] Acquiring ICU semaphore for patient %d...\n",
                    p.patient_id);
             sem_wait(&sem_icu);
         } else if (p.care_units == 2) {
-            /* ISOLATION patient */
+            
             printf("[SCHEDULER] Acquiring ISOLATION semaphore for patient %d...\n",
                    p.patient_id);
             sem_wait(&sem_isolation);
         }
-        /* GENERAL patients have no capacity semaphore (12 beds, rarely saturated) */
+        
 
-        /* ── ba_alloc() under bed_mutex (replaces inline Best-Fit) ──── */
+        
         pthread_mutex_lock(&bed_mutex);
 
         const char *req_type = bed_type_for(p.care_units);
         int bed_id = ba_alloc(&g_allocator, p.care_units, req_type, p.patient_id);
 
-        /* If no bed available, wait for a nurse to broadcast bed_freed */
+        
         while (bed_id == -1 && running) {
             printf("[SCHEDULER] No bed for patient %d — waiting on bed_freed.\n",
                    p.patient_id);
 
-            // #region agent log (H5: scheduler waiting for bed, possible stall)
             DBG2("pre", "H5", "admissions.c:thread_scheduler:wait_bed", "no_bed_wait",
                  "patient_id", p.patient_id, "care_units", p.care_units);
-            // #endregion
 
             pthread_cond_wait(&bed_freed, &bed_mutex);
             bed_id = ba_alloc(&g_allocator, p.care_units, req_type, p.patient_id);
@@ -426,16 +350,14 @@ static void *thread_scheduler(void *arg) {
             break;
         }
 
-        /* ba_alloc() already set is_free=0. Set patient_id then unlock. */
+        
         shm_ward[bed_id].patient_id = p.patient_id;
         pthread_mutex_unlock(&bed_mutex);
 
-        // #region agent log (H2: allocation choice vs care_units/type)
         DBG2("pre", "H2", "admissions.c:thread_scheduler:alloc", "allocated_bed",
              "patient_id", p.patient_id, "bed_id", bed_id);
-        // #endregion
 
-        /* ── mmap record write (Task 5) ──────────────────────────────── */
+        
         if (mmap_records) {
             int slot = p.patient_id % MAX_PATIENTS;
             pthread_mutex_lock(&mmap_mutex);
@@ -443,14 +365,12 @@ static void *thread_scheduler(void *arg) {
             pthread_mutex_unlock(&mmap_mutex);
         }
 
-        do_admit_to_bed(&p, bed_id); /* fork() — no mutex held */
+        do_admit_to_bed(&p, bed_id); 
     }
 
     printf("[SCHEDULER] Thread exiting.\n");
     return NULL;
 }
-
-/* ── Thread: Nurse (parametrized by NurseType) ──────────────────────── */
 
 static void *thread_nurse(void *arg) {
     NurseType type = (NurseType)(intptr_t)arg;
@@ -461,15 +381,15 @@ static void *thread_nurse(void *arg) {
     switch (type) {
         case NURSE_ICU:
             label = "NURSE-ICU";
-            range_start = 0;  range_end = 3;   /* beds 0-3   */
+            range_start = 0;  range_end = 3;   
             break;
         case NURSE_ISOLATION:
             label = "NURSE-ISOLATION";
-            range_start = 4;  range_end = 7;   /* beds 4-7   */
+            range_start = 4;  range_end = 7;   
             break;
-        default: /* NURSE_GENERAL */
+        default: 
             label = "NURSE-GENERAL";
-            range_start = 8;  range_end = 19;  /* beds 8-19  */
+            range_start = 8;  range_end = 19;  
             break;
     }
 
@@ -481,20 +401,15 @@ static void *thread_nurse(void *arg) {
     while (running) {
         int discharged_id = 0;
 
-        /* ── Step 1: check lost_ids[] buffer first (discharge_mutex held) ─
-         * lost_ids[] holds patient IDs read by another nurse that didn't match
-         * that nurse's bed range. This nurse checks if any belong to its range.
-         * This is a simple round-robin fallback, not a full routing layer.     */
+        
         pthread_mutex_lock(&discharge_mutex);
         for (int i = 0; i < lost_ids_count; i++) {
-            /* Peek at shm_ward WITHOUT bed_mutex here — only reading patient_id
-             * to see if it's in our range. bed_mutex is acquired below for
-             * the actual free operation (lock order: discharge → bed).         */
+            
             for (int b = range_start; b <= range_end; b++) {
                 if (!shm_ward[b].is_free &&
                     shm_ward[b].patient_id == lost_ids[i]) {
                     discharged_id = lost_ids[i];
-                    /* Remove from lost_ids[] by compacting */
+                    
                     for (int j = i; j < lost_ids_count - 1; j++)
                         lost_ids[j] = lost_ids[j + 1];
                     lost_ids_count--;
@@ -504,7 +419,7 @@ static void *thread_nurse(void *arg) {
             if (discharged_id > 0) break;
         }
 
-        /* ── Step 2: if no pending lost id, read a new one from the shared fd */
+        
         if (discharged_id == 0 && g_discharge_fd != -1) {
             ssize_t n = read(g_discharge_fd, buf, sizeof(buf) - 1);
 
@@ -514,7 +429,7 @@ static void *thread_nurse(void *arg) {
                 int id = atoi(buf);
 
                 if (id > 0) {
-                    /* Check if this id belongs to our bed range */
+                    
                     int mine = 0;
                     for (int b = range_start; b <= range_end; b++) {
                         if (!shm_ward[b].is_free &&
@@ -527,24 +442,20 @@ static void *thread_nurse(void *arg) {
                     if (mine) {
                         discharged_id = id;
                     } else if (lost_ids_count < LOST_IDS_MAX) {
-                        /* Not ours — park in lost_ids[] for another nurse */
+                        
                         lost_ids[lost_ids_count++] = id;
                         printf("[%s] Patient %d not in range — parked in "
                                "lost_ids[] (count=%d)\n",
                                label, id, lost_ids_count);
 
-                        // #region agent log (H3: discharge event routing via lost_ids)
                         DBG2("pre", "H3", "admissions.c:thread_nurse:park", "park_discharge_id",
                              "patient_id", id, "lost_count", lost_ids_count);
-                        // #endregion
                     } else {
                         fprintf(stderr, "[%s] lost_ids[] full — patient %d "
                                 "discharge event dropped.\n", label, id);
 
-                        // #region agent log (H3: discharge event dropped due to buffer full)
                         DBG1("pre", "H3", "admissions.c:thread_nurse:drop", "drop_discharge_id",
                              "patient_id", id);
-                        // #endregion
                     }
                 }
             } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -554,11 +465,11 @@ static void *thread_nurse(void *arg) {
         pthread_mutex_unlock(&discharge_mutex);
 
         if (discharged_id <= 0) {
-            usleep(100000); /* 100ms — no event this iteration */
+            usleep(100000); 
             continue;
         }
 
-        /* ── Step 3: free the bed via ba_free() (lock order: discharge→bed) */
+        
         pthread_mutex_lock(&bed_mutex);
 
         int freed_bed = -1;
@@ -578,19 +489,17 @@ static void *thread_nurse(void *arg) {
         printf("[%s] Discharging patient %d from bed %d.\n",
                label, discharged_id, freed_bed);
 
-        // #region agent log (H3/H1: discharge triggers free)
         DBG2("pre", "H3", "admissions.c:thread_nurse:free", "free_bed",
              "patient_id", discharged_id, "bed_id", freed_bed);
-        // #endregion
 
-        /* ba_free() handles is_free=1, coalescing, ward map, frag report */
+        
         ba_free(&g_allocator, freed_bed);
 
-        /* ── mmap discharge timestamp update (Task 5) ─────────────── */
+        
         if (mmap_records) {
             int slot = discharged_id % MAX_PATIENTS;
             pthread_mutex_lock(&mmap_mutex);
-            mmap_records[slot].arrival_time = time(NULL); /* discharge ts proxy */
+            mmap_records[slot].arrival_time = time(NULL); 
             pthread_mutex_unlock(&mmap_mutex);
         }
 
@@ -605,10 +514,8 @@ static void *thread_nurse(void *arg) {
     return NULL;
 }
 
-/* ── main ────────────────────────────────────────────────────────────── */
-
 int main(int argc, char *argv[]) {
-    /* ── Parse --strategy best|first|worst ───────────────────────────── */
+    
     AllocStrategy chosen_strategy = STRATEGY_BEST;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--strategy") == 0) {
@@ -634,7 +541,7 @@ int main(int argc, char *argv[]) {
     }
     printf("[ADMISSIONS] Strategy: %s\n", g_strategy_name);
 
-    /* ── Shared memory ──────────────────────────────────────────────── */
+    
     shm_ward = (BedPartition *)init_shared_memory();
     if (shm_ward == NULL) {
         fprintf(stderr, "[ADMISSIONS] Shared memory initialization failed.\n");
@@ -662,10 +569,10 @@ int main(int argc, char *argv[]) {
     }
     printf("[ADMISSIONS] Ward initialized: 4 ICU | 4 ISOLATION | 12 GENERAL\n");
 
-    /* ── BedAllocator init (Phase 4) ─────────────────────────────────── */
+    
     ba_init(&g_allocator, shm_ward, MAX_BEDS, chosen_strategy);
 
-    /* ── mmap patient record log (Phase 4, Task 5) ───────────────────── */
+    
     {
         int pr_fd = open("patient_records.dat", O_RDWR | O_CREAT, 0644);
         if (pr_fd == -1) {
@@ -690,7 +597,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* ── Semaphores ──────────────────────────────────────────────────── */
+    
     if (sem_init(&sem_icu,       0, ICU_CAPACITY)   != 0 ||
         sem_init(&sem_isolation, 0, ISOLATION_CAPACITY) != 0 ||
         sem_init(&sem_queue,     0, MAX_WAIT_QUEUE)  != 0) {
@@ -698,10 +605,10 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    /* ── Priority queue ──────────────────────────────────────────────── */
+    
     pq_init(&g_wait_queue);
 
-    /* ── Signal handlers ─────────────────────────────────────────────── */
+    
     struct sigaction sa_chld;
     memset(&sa_chld, 0, sizeof(sa_chld));
     sa_chld.sa_handler = sigchld_handler;
@@ -713,8 +620,8 @@ int main(int argc, char *argv[]) {
     sa_term.sa_handler = sigterm_handler;
     sigaction(SIGTERM, &sa_term, NULL);
 
-    /* ── Create FIFOs if they don't exist yet (Phase 4 self-contained start) */
-    /* mkfifo() with EEXIST ignored — safe to call every run */
+    
+    
     if (mkfifo(FIFO_TRIAGE_PATH, 0666) == -1 && errno != EEXIST) {
         perror("[ADMISSIONS] mkfifo triage");
         exit(1);
@@ -725,13 +632,11 @@ int main(int argc, char *argv[]) {
     }
     printf("[ADMISSIONS] FIFOs ready.\n");
 
-    /* ── Terminal UI — start before FIFO open so user sees the ward ─── */
+    
     ui_start(shm_ward, MAX_BEDS, g_strategy_name);
 
-    /* ── Open shared discharge FIFO (O_RDWR avoids blocking for a writer) */
-    /* Using O_RDWR on a FIFO is a POSIX trick: the fd is readable but the
-     * process holds the write-end reference itself, so open() never blocks.
-     * Nurse threads read patient_ids from this fd under discharge_mutex.  */
+    
+    
     g_discharge_fd = open(FIFO_DISCHARGE_PATH, O_RDWR | O_NONBLOCK);
     if (g_discharge_fd == -1) {
         perror("[ADMISSIONS] open discharge FIFO");
@@ -739,7 +644,7 @@ int main(int argc, char *argv[]) {
     }
     printf("[ADMISSIONS] Discharge FIFO open (fd=%d).\n", g_discharge_fd);
 
-    /* ── Thread launch ───────────────────────────────────────────────── */
+    
     pthread_t t_receptionist, t_scheduler;
     pthread_t t_nurse_icu, t_nurse_isolation, t_nurse_general;
 
@@ -751,17 +656,17 @@ int main(int argc, char *argv[]) {
 
     printf("[ADMISSIONS] 5 threads launched (1 receptionist, 1 scheduler, 3 nurses).\n");
 
-    /* ── Main thread: wait for SIGTERM ──────────────────────────────── */
+    
     while (running) {
-        pause(); /* sleep until any signal */
+        pause(); 
     }
 
     printf("[ADMISSIONS] Shutdown signal received. Joining threads...\n");
 
-    /* Stop terminal UI before joining threads */
+    
     ui_stop();
 
-    /* Wake threads that may be blocked in condvar waits */
+    
     pthread_mutex_lock(&g_queue_mutex);
     pthread_cond_broadcast(&patient_available);
     pthread_mutex_unlock(&g_queue_mutex);
@@ -770,54 +675,32 @@ int main(int argc, char *argv[]) {
     pthread_cond_broadcast(&bed_freed);
     pthread_mutex_unlock(&bed_mutex);
 
-    /* Also unblock receptionist/nurse FIFO reads with a short post */
+    
     sem_post(&sem_queue);
 
-    // #region agent log (H5: join order and where we stall)
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_begin", "{}");
-    // #endregion
 
-    // #region agent log
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_receptionist_begin", "{}");
-    // #endregion
     pthread_join(t_receptionist,    NULL);
-    // #region agent log
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_receptionist_done", "{}");
-    // #endregion
 
-    // #region agent log
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_scheduler_begin", "{}");
-    // #endregion
     pthread_join(t_scheduler,       NULL);
-    // #region agent log
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_scheduler_done", "{}");
-    // #endregion
 
-    // #region agent log
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_nurse_icu_begin", "{}");
-    // #endregion
     pthread_join(t_nurse_icu,       NULL);
-    // #region agent log
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_nurse_icu_done", "{}");
-    // #endregion
 
-    // #region agent log
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_nurse_isolation_begin", "{}");
-    // #endregion
     pthread_join(t_nurse_isolation, NULL);
-    // #region agent log
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_nurse_isolation_done", "{}");
-    // #endregion
 
-    // #region agent log
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_nurse_general_begin", "{}");
-    // #endregion
     pthread_join(t_nurse_general,   NULL);
-    // #region agent log
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_nurse_general_done", "{}");
-    // #endregion
 
-    /* ── Cleanup ────────────────────────────────────────────────────── */
+    
     sem_destroy(&sem_icu);
     sem_destroy(&sem_isolation);
     sem_destroy(&sem_queue);
@@ -832,7 +715,7 @@ int main(int argc, char *argv[]) {
 
     if (g_discharge_fd != -1) close(g_discharge_fd);
 
-    /* ── msync + munmap patient_records.dat ──────────────────────── */
+    
     if (mmap_records) {
         size_t pr_size = MAX_PATIENTS * sizeof(PatientRecord);
         msync(mmap_records, pr_size, MS_SYNC);
@@ -843,7 +726,7 @@ int main(int argc, char *argv[]) {
 
     detach_shared_memory(shm_ward);
 
-    /* ── Scheduling simulation report ──────────────────────────────── */
+    
     run_scheduling_simulation();
 
     printf("[ADMISSIONS] Shutdown complete.\n");
