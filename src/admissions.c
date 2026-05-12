@@ -222,59 +222,68 @@ static void *thread_receptionist(void *arg) {
         DBG2("pre", "H4", "admissions.c:thread_receptionist:read", "triage_fifo_read",
              "n", (long long)n, "has_nl", (long long)(strchr(buf, '\n') != NULL));
 
-        
         PatientRecord p;
         memset(&p, 0, sizeof(p));
 
-        char *tok = strtok(buf, "|");
-        if (!tok) continue;
-        p.patient_id = atoi(tok);
+        char *saveptr_line;
+        char *line = strtok_r(buf, "\n", &saveptr_line);
+        while (line) {
+            char *saveptr_tok;
+            char *tok = strtok_r(line, "|", &saveptr_tok);
+            if (!tok) { line = strtok_r(NULL, "\n", &saveptr_line); continue; }
+            p.patient_id = atoi(tok);
 
-        tok = strtok(NULL, "|");
-        if (!tok) continue;
-        strncpy(p.name, tok, sizeof(p.name) - 1);
+            tok = strtok_r(NULL, "|", &saveptr_tok);
+            if (!tok) { line = strtok_r(NULL, "\n", &saveptr_line); continue; }
+            strncpy(p.name, tok, sizeof(p.name) - 1);
 
-        tok = strtok(NULL, "|");
-        if (!tok) continue;
-        p.age = atoi(tok);
+            tok = strtok_r(NULL, "|", &saveptr_tok);
+            if (!tok) { line = strtok_r(NULL, "\n", &saveptr_line); continue; }
+            p.age = atoi(tok);
 
-        tok = strtok(NULL, "|");
-        if (!tok) continue;
-        p.severity = atoi(tok);
+            tok = strtok_r(NULL, "|", &saveptr_tok);
+            if (!tok) { line = strtok_r(NULL, "\n", &saveptr_line); continue; }
+            p.severity = atoi(tok);
 
-        tok = strtok(NULL, "|");
-        if (!tok) continue;
-        p.priority = atoi(tok);
+            tok = strtok_r(NULL, "|", &saveptr_tok);
+            if (!tok) { line = strtok_r(NULL, "\n", &saveptr_line); continue; }
+            p.priority = atoi(tok);
 
-        tok = strtok(NULL, "|");
-        if (!tok) continue;
-        p.care_units = atoi(tok);
+            tok = strtok_r(NULL, "|", &saveptr_tok);
+            if (!tok) { line = strtok_r(NULL, "\n", &saveptr_line); continue; }
+            p.care_units = atoi(tok);
 
-        tok = strtok(NULL, "|");
-        p.arrival_time = tok ? (time_t)atol(tok) : time(NULL);
+            tok = strtok_r(NULL, "|", &saveptr_tok);
+            p.arrival_time = tok ? (time_t)atol(tok) : time(NULL);
 
-        if (p.patient_id <= 0 || p.priority < 1 || p.priority > 5) continue;
+            if (p.patient_id <= 0 || p.priority < 1 || p.priority > 5) {
+                line = strtok_r(NULL, "\n", &saveptr_line);
+                continue;
+            }
 
-        
-        sem_wait(&sem_queue);
-
-        pthread_mutex_lock(&g_queue_mutex);
-        if (pq_push(&g_wait_queue, p) == 0) {
-            int depth = pq_size(&g_wait_queue);
-            printf("[RECEPTIONIST] Patient %d queued (priority %d, depth %d)\n",
-                   p.patient_id, p.priority, depth);
-            pthread_cond_signal(&patient_available);
-
-            DBG2("pre", "H4", "admissions.c:thread_receptionist:enqueue", "triage_parsed",
-                 "patient_id", p.patient_id, "priority", p.priority);
-        } else {
             
-            fprintf(stderr,
-                    "[RECEPTIONIST] PQ full — patient %d dropped.\n",
-                    p.patient_id);
-            sem_post(&sem_queue);
+            sem_wait(&sem_queue);
+
+            pthread_mutex_lock(&g_queue_mutex);
+            if (pq_push(&g_wait_queue, p) == 0) {
+                int depth = pq_size(&g_wait_queue);
+                printf("[RECEPTIONIST] Patient %d queued (priority %d, depth %d)\n",
+                       p.patient_id, p.priority, depth);
+                pthread_cond_signal(&patient_available);
+
+                DBG2("pre", "H4", "admissions.c:thread_receptionist:enqueue", "triage_parsed",
+                     "patient_id", p.patient_id, "priority", p.priority);
+            } else {
+                
+                fprintf(stderr,
+                        "[RECEPTIONIST] PQ full — patient %d dropped.\n",
+                        p.patient_id);
+                sem_post(&sem_queue);
+            }
+            pthread_mutex_unlock(&g_queue_mutex);
+
+            line = strtok_r(NULL, "\n", &saveptr_line);
         }
-        pthread_mutex_unlock(&g_queue_mutex);
     }
 
     if (fd != -1) close(fd);
@@ -425,38 +434,44 @@ static void *thread_nurse(void *arg) {
 
             if (n > 0) {
                 buf[n] = '\0';
-                buf[strcspn(buf, "\n\r ")] = '\0';
-                int id = atoi(buf);
+                char *saveptr_line;
+                char *line = strtok_r(buf, "\n\r ", &saveptr_line);
+                while (line) {
+                    int id = atoi(line);
 
-                if (id > 0) {
-                    
-                    int mine = 0;
-                    for (int b = range_start; b <= range_end; b++) {
-                        if (!shm_ward[b].is_free &&
-                            shm_ward[b].patient_id == id) {
-                            mine = 1;
-                            break;
+                    if (id > 0) {
+                        
+                        int mine = 0;
+                        for (int b = range_start; b <= range_end; b++) {
+                            if (!shm_ward[b].is_free &&
+                                shm_ward[b].patient_id == id) {
+                                mine = 1;
+                                break;
+                            }
+                        }
+
+                        if (mine && discharged_id == 0) {
+                            discharged_id = id;
+                        } else if (lost_ids_count < LOST_IDS_MAX) {
+                            
+                            lost_ids[lost_ids_count++] = id;
+                            if (!mine) {
+                                printf("[%s] Patient %d not in range — parked in "
+                                       "lost_ids[] (count=%d)\n",
+                                       label, id, lost_ids_count);
+                            }
+
+                            DBG2("pre", "H3", "admissions.c:thread_nurse:park", "park_discharge_id",
+                                 "patient_id", id, "lost_count", lost_ids_count);
+                        } else {
+                            fprintf(stderr, "[%s] lost_ids[] full — patient %d "
+                                    "discharge event dropped.\n", label, id);
+
+                            DBG1("pre", "H3", "admissions.c:thread_nurse:drop", "drop_discharge_id",
+                                 "patient_id", id);
                         }
                     }
-
-                    if (mine) {
-                        discharged_id = id;
-                    } else if (lost_ids_count < LOST_IDS_MAX) {
-                        
-                        lost_ids[lost_ids_count++] = id;
-                        printf("[%s] Patient %d not in range — parked in "
-                               "lost_ids[] (count=%d)\n",
-                               label, id, lost_ids_count);
-
-                        DBG2("pre", "H3", "admissions.c:thread_nurse:park", "park_discharge_id",
-                             "patient_id", id, "lost_count", lost_ids_count);
-                    } else {
-                        fprintf(stderr, "[%s] lost_ids[] full — patient %d "
-                                "discharge event dropped.\n", label, id);
-
-                        DBG1("pre", "H3", "admissions.c:thread_nurse:drop", "drop_discharge_id",
-                             "patient_id", id);
-                    }
+                    line = strtok_r(NULL, "\n\r ", &saveptr_line);
                 }
             } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                 perror("[NURSE] read discharge FIFO");

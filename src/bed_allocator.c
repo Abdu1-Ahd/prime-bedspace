@@ -192,16 +192,28 @@ void ba_print_ward_map(BedAllocator *a, const char *label) {
 void ba_fragmentation_report(BedAllocator *a, FILE *log) {
     int total_free   = 0;
     int largest_free = 0;
+    int current_block = 0;
+    const char *current_type = NULL;
+    int prev_idx = -2;
 
     FreeNode *cur = a->free_list;
     while (cur) {
-        int sz = a->ward[cur->partition_idx].size;
+        int idx = cur->partition_idx;
+        int sz = a->ward[idx].size;
         if (sz > 0) {
             total_free += sz;
-            if (sz > largest_free) largest_free = sz;
+            if (current_type && strcmp(current_type, a->ward[idx].bed_type) == 0 && idx == prev_idx + 1) {
+                current_block += sz;
+            } else {
+                if (current_block > largest_free) largest_free = current_block;
+                current_block = sz;
+                current_type = a->ward[idx].bed_type;
+            }
+            prev_idx = idx;
         }
         cur = cur->next;
     }
+    if (current_block > largest_free) largest_free = current_block;
 
     double ext_frag = 0.0;
     if (total_free > 0)
