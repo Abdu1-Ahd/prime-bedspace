@@ -13,7 +13,7 @@ usage() {
     exit 1
 }
 
-if [ "$
+if [ "$#" -ne 3 ]; then
     usage
 fi
 
