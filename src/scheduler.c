@@ -54,14 +54,14 @@ int pq_push(PriorityQueue *pq, PatientRecord p) {
 
 PatientRecord pq_pop(PriorityQueue *pq) {
     pthread_mutex_lock(&pq->lock);
-    if (pq->size == 0) {
+    if (!pq->size) {
         pthread_mutex_unlock(&pq->lock);
-        PatientRecord empty = {0};
-        empty.patient_id = -1;
-        return empty;
+        PatientRecord empty_record = {0};
+        empty_record.patient_id = -1;
+        return empty_record;
     }
 
-    PatientRecord result = pq->heap[0];
+    PatientRecord top_patient = pq->heap[0];
     pq->size--;
     pq->heap[0] = pq->heap[pq->size];
 
@@ -88,7 +88,7 @@ PatientRecord pq_pop(PriorityQueue *pq) {
     }
 
     pthread_mutex_unlock(&pq->lock);
-    return result;
+    return top_patient;
 }
 
 int pq_peek_copy(PriorityQueue *pq, PatientRecord *out) {
@@ -103,9 +103,9 @@ int pq_peek_copy(PriorityQueue *pq, PatientRecord *out) {
 
 int pq_is_empty(PriorityQueue *pq) {
     pthread_mutex_lock(&pq->lock);
-    int empty = (pq->size == 0);
+    int is_empty = (!pq->size);
     pthread_mutex_unlock(&pq->lock);
-    return empty;
+    return is_empty;
 }
 
 int pq_size(PriorityQueue *pq) {
@@ -176,7 +176,7 @@ static int simulate_single_server(ScheduleEvent *events, int n,
 }
 
 void run_scheduling_simulation(void) {
-    if (g_event_count == 0) {
+    if (!g_event_count) {
         printf("[SCHED] No admission events recorded — simulation skipped.\n");
         return;
     }

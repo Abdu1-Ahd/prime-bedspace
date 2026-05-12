@@ -47,7 +47,7 @@ PriorityQueue g_wait_queue;
 static BedPartition *shm_ward   = NULL;
 static volatile sig_atomic_t running = 1;
 
-static pid_t child_pids[50];
+static pid_t child_pids[MAX_CHILDREN];
 static int   child_count = 0;
 static pthread_mutex_t child_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -55,7 +55,6 @@ static pthread_mutex_t discharge_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int g_discharge_fd = -1;
 
-#define LOST_IDS_MAX 3
 static int  lost_ids[LOST_IDS_MAX];
 static int  lost_ids_count = 0;
 
@@ -101,9 +100,9 @@ static const char *bed_type_for(int care_units) {
     return "GENERAL";
 }
 
-static void do_admit_to_bed(PatientRecord *p, int bed_id) {
+static void assign_bed(PatientRecord *p, int bed_id) {
     pthread_mutex_lock(&child_mutex);
-    if (child_count >= 50) {
+    if (child_count >= MAX_CHILDREN) {
         fprintf(stderr, "[ADMISSIONS] child_pids table full — cannot fork.\n");
         pthread_mutex_unlock(&child_mutex);
         
@@ -169,6 +168,39 @@ static void do_admit_to_bed(PatientRecord *p, int bed_id) {
                         p->arrival_time, admit_time, p->care_units);
 }
 
+static int parse_patient_record(char *line, PatientRecord *p) {
+    char *saveptr_tok;
+    char *field_token = strtok_r(line, "|", &saveptr_tok);
+    if (!field_token) return 0;
+    p->patient_id = atoi(field_token);
+
+    field_token = strtok_r(NULL, "|", &saveptr_tok);
+    if (!field_token) return 0;
+    strncpy(p->name, field_token, sizeof(p->name) - 1);
+
+    field_token = strtok_r(NULL, "|", &saveptr_tok);
+    if (!field_token) return 0;
+    p->age = atoi(field_token);
+
+    field_token = strtok_r(NULL, "|", &saveptr_tok);
+    if (!field_token) return 0;
+    p->severity = atoi(field_token);
+
+    field_token = strtok_r(NULL, "|", &saveptr_tok);
+    if (!field_token) return 0;
+    p->priority = atoi(field_token);
+
+    field_token = strtok_r(NULL, "|", &saveptr_tok);
+    if (!field_token) return 0;
+    p->care_units = atoi(field_token);
+
+    field_token = strtok_r(NULL, "|", &saveptr_tok);
+    p->arrival_time = field_token ? (time_t)atol(field_token) : time(NULL);
+
+    if (p->patient_id <= 0 || p->priority < 1 || p->priority > 5) return 0;
+    return 1;
+}
+
 static void *thread_receptionist(void *arg) {
     (void)arg;
     printf("[RECEPTIONIST] Thread started. Waiting for triage FIFO: %s\n",
@@ -180,18 +212,18 @@ static void *thread_receptionist(void *arg) {
     
     while (fd == -1 && running) {
         fd = open_triage_fifo_read(); 
-        if (fd == -1) sleep(1);
+        if (fd == -1) usleep(SLEEP_100MS_US);
     }
 
-    char buf[256];
+    char fifo_buffer[FIFO_BUF_SIZE];
 
     while (running) {
         struct pollfd pfd;
         pfd.fd     = fd;
         pfd.events = POLLIN;
 
-        int pr = poll(&pfd, 1, 500); 
-        if (pr == 0) continue;       
+        int pr = poll(&pfd, 1, POLL_TIMEOUT_MS); 
+        if (!pr) continue;       
         if (pr < 0) {
             if (errno == EINTR) continue;
             perror("[RECEPTIONIST] poll triage FIFO");
@@ -200,72 +232,42 @@ static void *thread_receptionist(void *arg) {
 
         if (!(pfd.revents & POLLIN)) continue;
 
-        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        ssize_t n = read(fd, fifo_buffer, sizeof(fifo_buffer) - 1);
 
         if (n <= 0) {
             if (!running) break;
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
 
-            
             if (fd != -1) close(fd);
             fd = -1;
             while (fd == -1 && running) {
                 fd = open_triage_fifo_read();
-                if (fd == -1) sleep(1);
+                if (fd == -1) usleep(SLEEP_100MS_US);
             }
             if (!running) break;
             continue;
         }
 
-        buf[n] = '\0';
+        fifo_buffer[n] = '\0';
 
         DBG2("pre", "H4", "admissions.c:thread_receptionist:read", "triage_fifo_read",
-             "n", (long long)n, "has_nl", (long long)(strchr(buf, '\n') != NULL));
+             "n", (long long)n, "has_nl", (long long)(strchr(fifo_buffer, '\n') != NULL));
 
         PatientRecord p;
         memset(&p, 0, sizeof(p));
 
         char *saveptr_line;
-        char *line = strtok_r(buf, "\n", &saveptr_line);
+        char *line = strtok_r(fifo_buffer, "\n", &saveptr_line);
         while (line) {
-            char *saveptr_tok;
-            char *tok = strtok_r(line, "|", &saveptr_tok);
-            if (!tok) { line = strtok_r(NULL, "\n", &saveptr_line); continue; }
-            p.patient_id = atoi(tok);
-
-            tok = strtok_r(NULL, "|", &saveptr_tok);
-            if (!tok) { line = strtok_r(NULL, "\n", &saveptr_line); continue; }
-            strncpy(p.name, tok, sizeof(p.name) - 1);
-
-            tok = strtok_r(NULL, "|", &saveptr_tok);
-            if (!tok) { line = strtok_r(NULL, "\n", &saveptr_line); continue; }
-            p.age = atoi(tok);
-
-            tok = strtok_r(NULL, "|", &saveptr_tok);
-            if (!tok) { line = strtok_r(NULL, "\n", &saveptr_line); continue; }
-            p.severity = atoi(tok);
-
-            tok = strtok_r(NULL, "|", &saveptr_tok);
-            if (!tok) { line = strtok_r(NULL, "\n", &saveptr_line); continue; }
-            p.priority = atoi(tok);
-
-            tok = strtok_r(NULL, "|", &saveptr_tok);
-            if (!tok) { line = strtok_r(NULL, "\n", &saveptr_line); continue; }
-            p.care_units = atoi(tok);
-
-            tok = strtok_r(NULL, "|", &saveptr_tok);
-            p.arrival_time = tok ? (time_t)atol(tok) : time(NULL);
-
-            if (p.patient_id <= 0 || p.priority < 1 || p.priority > 5) {
+            if (!parse_patient_record(line, &p)) {
                 line = strtok_r(NULL, "\n", &saveptr_line);
                 continue;
             }
 
-            
             sem_wait(&sem_queue);
 
             pthread_mutex_lock(&g_queue_mutex);
-            if (pq_push(&g_wait_queue, p) == 0) {
+            if (!pq_push(&g_wait_queue, p)) {
                 int depth = pq_size(&g_wait_queue);
                 printf("[RECEPTIONIST] Patient %d queued (priority %d, depth %d)\n",
                        p.patient_id, p.priority, depth);
@@ -274,7 +276,6 @@ static void *thread_receptionist(void *arg) {
                 DBG2("pre", "H4", "admissions.c:thread_receptionist:enqueue", "triage_parsed",
                      "patient_id", p.patient_id, "priority", p.priority);
             } else {
-                
                 fprintf(stderr,
                         "[RECEPTIONIST] PQ full — patient %d dropped.\n",
                         p.patient_id);
@@ -374,7 +375,7 @@ static void *thread_scheduler(void *arg) {
             pthread_mutex_unlock(&mmap_mutex);
         }
 
-        do_admit_to_bed(&p, bed_id); 
+        assign_bed(&p, bed_id); 
     }
 
     printf("[SCHEDULER] Thread exiting.\n");
@@ -405,20 +406,17 @@ static void *thread_nurse(void *arg) {
     printf("[%s] Thread started. Monitoring beds %d-%d.\n",
            label, range_start, range_end);
 
-    char buf[64];
+    char fifo_buffer[MSG_BUF_SIZE];
 
     while (running) {
         int discharged_id = 0;
 
-        
         pthread_mutex_lock(&discharge_mutex);
         for (int i = 0; i < lost_ids_count; i++) {
-            
             for (int b = range_start; b <= range_end; b++) {
                 if (!shm_ward[b].is_free &&
                     shm_ward[b].patient_id == lost_ids[i]) {
                     discharged_id = lost_ids[i];
-                    
                     for (int j = i; j < lost_ids_count - 1; j++)
                         lost_ids[j] = lost_ids[j + 1];
                     lost_ids_count--;
@@ -428,45 +426,38 @@ static void *thread_nurse(void *arg) {
             if (discharged_id > 0) break;
         }
 
-        
-        if (discharged_id == 0 && g_discharge_fd != -1) {
-            ssize_t n = read(g_discharge_fd, buf, sizeof(buf) - 1);
+        if (!discharged_id && g_discharge_fd != -1) {
+            ssize_t n = read(g_discharge_fd, fifo_buffer, sizeof(fifo_buffer) - 1);
 
             if (n > 0) {
-                buf[n] = '\0';
+                fifo_buffer[n] = '\0';
                 char *saveptr_line;
-                char *line = strtok_r(buf, "\n\r ", &saveptr_line);
+                char *line = strtok_r(fifo_buffer, "\n\r ", &saveptr_line);
                 while (line) {
                     int id = atoi(line);
-
                     if (id > 0) {
-                        
                         int mine = 0;
                         for (int b = range_start; b <= range_end; b++) {
-                            if (!shm_ward[b].is_free &&
-                                shm_ward[b].patient_id == id) {
+                            if (!shm_ward[b].is_free && shm_ward[b].patient_id == id) {
                                 mine = 1;
                                 break;
                             }
                         }
 
-                        if (mine && discharged_id == 0) {
+                        if (mine && !discharged_id) {
                             discharged_id = id;
                         } else if (lost_ids_count < LOST_IDS_MAX) {
-                            
                             lost_ids[lost_ids_count++] = id;
                             if (!mine) {
                                 printf("[%s] Patient %d not in range — parked in "
                                        "lost_ids[] (count=%d)\n",
                                        label, id, lost_ids_count);
                             }
-
                             DBG2("pre", "H3", "admissions.c:thread_nurse:park", "park_discharge_id",
                                  "patient_id", id, "lost_count", lost_ids_count);
                         } else {
                             fprintf(stderr, "[%s] lost_ids[] full — patient %d "
                                     "discharge event dropped.\n", label, id);
-
                             DBG1("pre", "H3", "admissions.c:thread_nurse:drop", "drop_discharge_id",
                                  "patient_id", id);
                         }
@@ -480,7 +471,7 @@ static void *thread_nurse(void *arg) {
         pthread_mutex_unlock(&discharge_mutex);
 
         if (discharged_id <= 0) {
-            usleep(100000); 
+            usleep(SLEEP_100MS_US); 
             continue;
         }
 
@@ -529,25 +520,15 @@ static void *thread_nurse(void *arg) {
     return NULL;
 }
 
-int main(int argc, char *argv[]) {
-    
+static AllocStrategy parse_arguments(int argc, char *argv[]) {
     AllocStrategy chosen_strategy = STRATEGY_BEST;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--strategy") == 0) {
+        if (!strcmp(argv[i], "--strategy")) {
             if (i + 1 < argc) {
-                if      (strcmp(argv[i + 1], "first") == 0) {
-                    chosen_strategy = STRATEGY_FIRST;
-                    g_strategy_name = "first";
-                } else if (strcmp(argv[i + 1], "worst") == 0) {
-                    chosen_strategy = STRATEGY_WORST;
-                    g_strategy_name = "worst";
-                } else if (strcmp(argv[i + 1], "best") == 0) {
-                    chosen_strategy = STRATEGY_BEST;
-                    g_strategy_name = "best";
-                } else {
-                    fprintf(stderr, "[ADMISSIONS] Unknown strategy '%s' — using 'best'.\n",
-                            argv[i + 1]);
-                }
+                if      (!strcmp(argv[i + 1], "first")) { chosen_strategy = STRATEGY_FIRST; g_strategy_name = "first"; }
+                else if (!strcmp(argv[i + 1], "worst")) { chosen_strategy = STRATEGY_WORST; g_strategy_name = "worst"; }
+                else if (!strcmp(argv[i + 1], "best"))  { chosen_strategy = STRATEGY_BEST;  g_strategy_name = "best"; }
+                else fprintf(stderr, "[ADMISSIONS] Unknown strategy '%s' — using 'best'.\n", argv[i + 1]);
             } else {
                 fprintf(stderr, "[ADMISSIONS] Missing value for --strategy — using 'best'.\n");
             }
@@ -555,10 +536,12 @@ int main(int argc, char *argv[]) {
         }
     }
     printf("[ADMISSIONS] Strategy: %s\n", g_strategy_name);
+    return chosen_strategy;
+}
 
-    
+static void init_subsystems(AllocStrategy chosen_strategy) {
     shm_ward = (BedPartition *)init_shared_memory();
-    if (shm_ward == NULL) {
+    if (!shm_ward) {
         fprintf(stderr, "[ADMISSIONS] Shared memory initialization failed.\n");
         exit(1);
     }
@@ -584,59 +567,36 @@ int main(int argc, char *argv[]) {
     }
     printf("[ADMISSIONS] Ward initialized: 4 ICU | 4 ISOLATION | 12 GENERAL\n");
 
-    
     ba_init(&g_allocator, shm_ward, MAX_BEDS, chosen_strategy);
 
-    
-    {
-        int pr_fd = open("patient_records.dat", O_RDWR | O_CREAT, 0644);
-        if (pr_fd == -1) {
-            perror("[ADMISSIONS] open patient_records.dat");
+    int pr_fd = open("patient_records.dat", O_RDWR | O_CREAT, 0644);
+    if (pr_fd == -1) {
+        perror("[ADMISSIONS] open patient_records.dat");
+    } else {
+        size_t pr_size = MAX_PATIENTS * sizeof(PatientRecord);
+        if (ftruncate(pr_fd, (off_t)pr_size) == -1) {
+            perror("[ADMISSIONS] ftruncate patient_records.dat");
         } else {
-            size_t pr_size = MAX_PATIENTS * sizeof(PatientRecord);
-            if (ftruncate(pr_fd, (off_t)pr_size) == -1) {
-                perror("[ADMISSIONS] ftruncate patient_records.dat");
+            void *ptr = mmap(NULL, pr_size, PROT_READ | PROT_WRITE, MAP_SHARED, pr_fd, 0);
+            if (ptr == MAP_FAILED) {
+                perror("[ADMISSIONS] mmap patient_records.dat");
             } else {
-                void *ptr = mmap(NULL, pr_size,
-                                 PROT_READ | PROT_WRITE, MAP_SHARED,
-                                 pr_fd, 0);
-                if (ptr == MAP_FAILED) {
-                    perror("[ADMISSIONS] mmap patient_records.dat");
-                } else {
-                    mmap_records = (PatientRecord *)ptr;
-                    printf("[ADMISSIONS] patient_records.dat mmap'd (%zu bytes).\n",
-                           pr_size);
-                }
+                mmap_records = (PatientRecord *)ptr;
+                printf("[ADMISSIONS] patient_records.dat mmap'd (%zu bytes).\n", pr_size);
             }
-            close(pr_fd);
         }
+        close(pr_fd);
     }
 
-    
-    if (sem_init(&sem_icu,       0, ICU_CAPACITY)   != 0 ||
-        sem_init(&sem_isolation, 0, ISOLATION_CAPACITY) != 0 ||
-        sem_init(&sem_queue,     0, MAX_WAIT_QUEUE)  != 0) {
+    if (sem_init(&sem_icu, 0, ICU_CAPACITY) || sem_init(&sem_isolation, 0, ISOLATION_CAPACITY) || sem_init(&sem_queue, 0, MAX_WAIT_QUEUE)) {
         perror("[ADMISSIONS] sem_init failed");
         exit(1);
     }
 
-    
     pq_init(&g_wait_queue);
+}
 
-    
-    struct sigaction sa_chld;
-    memset(&sa_chld, 0, sizeof(sa_chld));
-    sa_chld.sa_handler = sigchld_handler;
-    sa_chld.sa_flags   = SA_RESTART | SA_NOCLDSTOP;
-    sigaction(SIGCHLD, &sa_chld, NULL);
-
-    struct sigaction sa_term;
-    memset(&sa_term, 0, sizeof(sa_term));
-    sa_term.sa_handler = sigterm_handler;
-    sigaction(SIGTERM, &sa_term, NULL);
-
-    
-    
+static void launch_worker_threads(pthread_t *t_receptionist, pthread_t *t_scheduler, pthread_t *t_nurse_icu, pthread_t *t_nurse_isolation, pthread_t *t_nurse_general) {
     if (mkfifo(FIFO_TRIAGE_PATH, 0666) == -1 && errno != EEXIST) {
         perror("[ADMISSIONS] mkfifo triage");
         exit(1);
@@ -647,11 +607,8 @@ int main(int argc, char *argv[]) {
     }
     printf("[ADMISSIONS] FIFOs ready.\n");
 
-    
     ui_start(shm_ward, MAX_BEDS, g_strategy_name);
 
-    
-    
     g_discharge_fd = open(FIFO_DISCHARGE_PATH, O_RDWR | O_NONBLOCK);
     if (g_discharge_fd == -1) {
         perror("[ADMISSIONS] open discharge FIFO");
@@ -659,29 +616,18 @@ int main(int argc, char *argv[]) {
     }
     printf("[ADMISSIONS] Discharge FIFO open (fd=%d).\n", g_discharge_fd);
 
-    
-    pthread_t t_receptionist, t_scheduler;
-    pthread_t t_nurse_icu, t_nurse_isolation, t_nurse_general;
-
-    pthread_create(&t_receptionist,   NULL, thread_receptionist, NULL);
-    pthread_create(&t_scheduler,      NULL, thread_scheduler,    NULL);
-    pthread_create(&t_nurse_icu,      NULL, thread_nurse, (void *)(intptr_t)NURSE_ICU);
-    pthread_create(&t_nurse_isolation,NULL, thread_nurse, (void *)(intptr_t)NURSE_ISOLATION);
-    pthread_create(&t_nurse_general,  NULL, thread_nurse, (void *)(intptr_t)NURSE_GENERAL);
+    pthread_create(t_receptionist,   NULL, thread_receptionist, NULL);
+    pthread_create(t_scheduler,      NULL, thread_scheduler,    NULL);
+    pthread_create(t_nurse_icu,      NULL, thread_nurse, (void *)(intptr_t)NURSE_ICU);
+    pthread_create(t_nurse_isolation,NULL, thread_nurse, (void *)(intptr_t)NURSE_ISOLATION);
+    pthread_create(t_nurse_general,  NULL, thread_nurse, (void *)(intptr_t)NURSE_GENERAL);
 
     printf("[ADMISSIONS] 5 threads launched (1 receptionist, 1 scheduler, 3 nurses).\n");
+}
 
-    
-    while (running) {
-        pause(); 
-    }
-
-    printf("[ADMISSIONS] Shutdown signal received. Joining threads...\n");
-
-    
+static void cleanup_and_exit(pthread_t t_receptionist, pthread_t t_scheduler, pthread_t t_nurse_icu, pthread_t t_nurse_isolation, pthread_t t_nurse_general) {
     ui_stop();
 
-    
     pthread_mutex_lock(&g_queue_mutex);
     pthread_cond_broadcast(&patient_available);
     pthread_mutex_unlock(&g_queue_mutex);
@@ -690,21 +636,20 @@ int main(int argc, char *argv[]) {
     pthread_cond_broadcast(&bed_freed);
     pthread_mutex_unlock(&bed_mutex);
 
-    
     sem_post(&sem_queue);
 
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_begin", "{}");
 
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_receptionist_begin", "{}");
-    pthread_join(t_receptionist,    NULL);
+    pthread_join(t_receptionist, NULL);
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_receptionist_done", "{}");
 
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_scheduler_begin", "{}");
-    pthread_join(t_scheduler,       NULL);
+    pthread_join(t_scheduler, NULL);
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_scheduler_done", "{}");
 
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_nurse_icu_begin", "{}");
-    pthread_join(t_nurse_icu,       NULL);
+    pthread_join(t_nurse_icu, NULL);
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_nurse_icu_done", "{}");
 
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_nurse_isolation_begin", "{}");
@@ -712,10 +657,9 @@ int main(int argc, char *argv[]) {
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_nurse_isolation_done", "{}");
 
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_nurse_general_begin", "{}");
-    pthread_join(t_nurse_general,   NULL);
+    pthread_join(t_nurse_general, NULL);
     dbg_write_ndjson("pre", "H5", "admissions.c:main", "join_nurse_general_done", "{}");
 
-    
     sem_destroy(&sem_icu);
     sem_destroy(&sem_isolation);
     sem_destroy(&sem_queue);
@@ -730,7 +674,6 @@ int main(int argc, char *argv[]) {
 
     if (g_discharge_fd != -1) close(g_discharge_fd);
 
-    
     if (mmap_records) {
         size_t pr_size = MAX_PATIENTS * sizeof(PatientRecord);
         msync(mmap_records, pr_size, MS_SYNC);
@@ -740,10 +683,36 @@ int main(int argc, char *argv[]) {
     }
 
     detach_shared_memory(shm_ward);
-
-    
     run_scheduling_simulation();
 
     printf("[ADMISSIONS] Shutdown complete.\n");
+}
+
+int main(int argc, char *argv[]) {
+    AllocStrategy chosen_strategy = parse_arguments(argc, argv);
+    init_subsystems(chosen_strategy);
+
+    struct sigaction sa_chld;
+    memset(&sa_chld, 0, sizeof(sa_chld));
+    sa_chld.sa_handler = sigchld_handler;
+    sa_chld.sa_flags   = SA_RESTART | SA_NOCLDSTOP;
+    sigaction(SIGCHLD, &sa_chld, NULL);
+
+    struct sigaction sa_term;
+    memset(&sa_term, 0, sizeof(sa_term));
+    sa_term.sa_handler = sigterm_handler;
+    sigaction(SIGTERM, &sa_term, NULL);
+
+    pthread_t t_receptionist, t_scheduler;
+    pthread_t t_nurse_icu, t_nurse_isolation, t_nurse_general;
+    launch_worker_threads(&t_receptionist, &t_scheduler, &t_nurse_icu, &t_nurse_isolation, &t_nurse_general);
+
+    while (running) {
+        pause(); 
+    }
+
+    printf("[ADMISSIONS] Shutdown signal received. Joining threads...\n");
+    cleanup_and_exit(t_receptionist, t_scheduler, t_nurse_icu, t_nurse_isolation, t_nurse_general);
+
     return 0;
 }

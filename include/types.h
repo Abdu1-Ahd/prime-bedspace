@@ -22,6 +22,14 @@
 #define MAX_PATIENTS        100  
 #define SHM_KEY             0xBEDF00D
 
+#define MAX_CHILDREN        50
+#define LOST_IDS_MAX        3
+#define FIFO_BUF_SIZE       256
+#define MSG_BUF_SIZE        64
+#define POLL_TIMEOUT_MS     500
+#define SLEEP_100MS_US      100000
+#define UI_REFRESH_US       500000
+
 typedef enum {
     NURSE_ICU = 0,
     NURSE_ISOLATION,

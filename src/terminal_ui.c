@@ -31,7 +31,7 @@ static void *render_loop(void *arg) {
 
     while (ui_running) {
         ui_render(g_ui_ward, g_ui_total);
-        sleep(1);
+        usleep(UI_REFRESH_US);
     }
     return NULL;
 }
@@ -51,8 +51,8 @@ void ui_render(BedPartition *ward, int total) {
     for (int t = 0; t < 3; t++) {
         printf("  %s: ", labels[t]);
         for (int i = 0; i < total; i++) {
-            if (ward[i].size == 0) continue; 
-            if (strcmp(ward[i].bed_type, types[t]) != 0) continue;
+            if (!ward[i].size) continue; 
+            if (strcmp(ward[i].bed_type, types[t])) continue;
 
             if (!ward[i].is_free) {
                 
@@ -68,7 +68,7 @@ void ui_render(BedPartition *ward, int total) {
     
     static int last_depth = 0;
     int trylock_failed = 0;
-    if (pthread_mutex_trylock(&g_queue_mutex) == 0) {
+    if (!pthread_mutex_trylock(&g_queue_mutex)) {
         last_depth = g_wait_queue.size;
         pthread_mutex_unlock(&g_queue_mutex);
     } else {
@@ -95,7 +95,7 @@ void ui_start(BedPartition *ward, int total, const char *strategy) {
     g_ui_strategy = strategy ? strategy : "best";
     ui_running    = 1;
 
-    if (pthread_create(&ui_thread, NULL, render_loop, NULL) != 0) {
+    if (pthread_create(&ui_thread, NULL, render_loop, NULL)) {
         perror("[UI] pthread_create failed");
         ui_running = 0;
         return;

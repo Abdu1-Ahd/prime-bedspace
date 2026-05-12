@@ -30,11 +30,11 @@ int main(int argc, char *argv[]) {
     char *bed_type = argv[4];
 
     char *color = "\033[0m"; 
-    if (strcmp(bed_type, "ICU") == 0) {
+    if (!strcmp(bed_type, "ICU")) {
         color = "\033[1;31m"; 
-    } else if (strcmp(bed_type, "ISOLATION") == 0) {
+    } else if (!strcmp(bed_type, "ISOLATION")) {
         color = "\033[1;33m"; 
-    } else if (strcmp(bed_type, "GENERAL") == 0) {
+    } else if (!strcmp(bed_type, "GENERAL")) {
         color = "\033[1;36m"; 
     }
 
@@ -42,11 +42,11 @@ int main(int argc, char *argv[]) {
 
     srand(getpid());
     int sleep_sec = 0;
-    if (strcmp(bed_type, "ICU") == 0) {
+    if (!strcmp(bed_type, "ICU")) {
         sleep_sec = (rand() % 11) + 5;
-    } else if (strcmp(bed_type, "ISOLATION") == 0) {
+    } else if (!strcmp(bed_type, "ISOLATION")) {
         sleep_sec = (rand() % 8) + 3;
-    } else if (strcmp(bed_type, "GENERAL") == 0) {
+    } else if (!strcmp(bed_type, "GENERAL")) {
         sleep_sec = (rand() % 7) + 2;
     } else {
         sleep_sec = 1;

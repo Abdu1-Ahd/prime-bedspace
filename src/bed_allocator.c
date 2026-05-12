@@ -90,8 +90,7 @@ int ba_alloc(BedAllocator *a, int care_units, const char *bed_type,
         int idx = cur->partition_idx;
 
         
-        if (a->ward[idx].size >= care_units &&
-            strcmp(a->ward[idx].bed_type, bed_type) == 0) {
+        if (a->ward[idx].size >= care_units && !strcmp(a->ward[idx].bed_type, bed_type)) {
 
             int delta = a->ward[idx].size - care_units;
 
@@ -137,11 +136,11 @@ found:
     a->ward[idx].is_free = 0;
 
     {
-        char data[256];
-        snprintf(data, sizeof(data),
+        char json_payload[FIFO_BUF_SIZE];
+        snprintf(json_payload, sizeof(json_payload),
                  "{\"patient_id\":%d,\"care_units\":%d,\"idx\":%d,\"bed_size\":%d}",
                  patient_id_hint, care_units, idx, a->ward[idx].size);
-        dbg_write_ndjson("pre", "H2", "bed_allocator.c:ba_alloc", "alloc_choice", data);
+        dbg_write_ndjson("pre", "H2", "bed_allocator.c:ba_alloc", "alloc_choice", json_payload);
     }
 
     
@@ -176,13 +175,13 @@ void ba_free(BedAllocator *a, int partition_idx) {
 void ba_print_ward_map(BedAllocator *a, const char *label) {
     printf("[MAP %s] ", label);
     for (int i = 0; i < a->total; i++) {
-        if (a->ward[i].size == 0) continue; 
+        if (!a->ward[i].size) continue; 
         const char *type = a->ward[i].bed_type;
         const char *abbr;
 
-        if      (strcmp(type, "ICU")       == 0) abbr = "ICU";
-        else if (strcmp(type, "ISOLATION") == 0) abbr = "ISO";
-        else                                      abbr = "GEN";
+        if      (!strcmp(type, "ICU"))       abbr = "ICU";
+        else if (!strcmp(type, "ISOLATION")) abbr = "ISO";
+        else                                 abbr = "GEN";
 
         printf("[%s:%s]", abbr, a->ward[i].is_free ? "FREE" : "OCC ");
     }
@@ -199,14 +198,14 @@ void ba_fragmentation_report(BedAllocator *a, FILE *log) {
     FreeNode *cur = a->free_list;
     while (cur) {
         int idx = cur->partition_idx;
-        int sz = a->ward[idx].size;
-        if (sz > 0) {
-            total_free += sz;
-            if (current_type && strcmp(current_type, a->ward[idx].bed_type) == 0 && idx == prev_idx + 1) {
-                current_block += sz;
+        int partition_size = a->ward[idx].size;
+        if (partition_size > 0) {
+            total_free += partition_size;
+            if (current_type && !strcmp(current_type, a->ward[idx].bed_type) && idx == prev_idx + 1) {
+                current_block += partition_size;
             } else {
                 if (current_block > largest_free) largest_free = current_block;
-                current_block = sz;
+                current_block = partition_size;
                 current_type = a->ward[idx].bed_type;
             }
             prev_idx = idx;
