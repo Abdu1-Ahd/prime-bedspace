@@ -1,3 +1,14 @@
+/*
+ * ============================================================
+ * Project : Prime BedSpace - Hospital Patient Triage & Bed Allocator
+ * File    : types.h
+ * Group   : Group 14
+ * Members : Abdul Ahad (24F-0727), Abdul Rahim (24F-0514)
+ * Date    : 2026-05-12
+ * Purpose : Core type definitions — PatientRecord and BedPartition structs plus system-wide constants.
+ * Compile : gcc -Wall -Wextra -pthread -Iinclude <file> -lrt -lpthread
+ * ============================================================
+ */
 #ifndef TYPES_H
 #define TYPES_H
 
@@ -7,7 +18,8 @@
 #define ICU_CAPACITY        4
 #define ISOLATION_CAPACITY  4
 #define GENERAL_CAPACITY    12
-#define MAX_WAIT_QUEUE      20   /* bounded sem capacity: receptionist→scheduler */
+#define MAX_WAIT_QUEUE      20   
+#define MAX_PATIENTS        100  
 #define SHM_KEY             0xBEDF00D
 
 typedef enum {
@@ -30,12 +42,12 @@ typedef struct {
 
 typedef struct {
     int    patient_id;
-    int    priority;         /* triage level 1-5 (1 = most urgent) */
-    time_t arrival_time;     /* epoch seconds when patient arrived  */
-    time_t start_time;       /* epoch seconds when admitted to bed  */
-    long   wait_time;        /* start_time - arrival_time           */
-    long   service_time;     /* estimated treatment duration (s)    */
-    long   turnaround_time;  /* wait_time + service_time            */
+    int    priority;         
+    time_t arrival_time;     
+    time_t start_time;       
+    long   wait_time;        
+    long   service_time;     
+    long   turnaround_time;  
 } ScheduleEvent;
 
 typedef struct {
@@ -47,4 +59,4 @@ typedef struct {
     char bed_type[16];
 } BedPartition;
 
-#endif /* TYPES_H */
+#endif 

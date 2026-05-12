@@ -1,17 +1,14 @@
-/**
- * ==============================================================================
- * Project: Prime BedSpace
- * File: patient_simulator.c
- * Group: Zawiar & Subhani
- * Members: Abdul Ahad Zawiar (Abdu1-Ahd), AbdulRahim Subhani (abdulrahim-subh)
- * Date: 2026-05-08
- * Purpose: Simulates a patient treatment lifecycle including random sleep and 
- *          FIFO IPC messaging upon discharge.
- * Compile: gcc -Wall -Wextra -pthread src/patient_simulator.c src/ipc_utils.c -o build/patient_simulator -lrt
- * Usage: ./build/patient_simulator <patient_id> <triage_level> <bed_id> <bed_type>
- * ==============================================================================
+/*
+ * ============================================================
+ * Project : Prime BedSpace - Hospital Patient Triage & Bed Allocator
+ * File    : patient_simulator.c
+ * Group   : Group 14
+ * Members : Abdul Ahad (24F-0727), Abdul Rahim (24F-0514)
+ * Date    : 2026-05-12
+ * Purpose : Simulates patient treatment lifecycle — prints arrival/discharge messages, sleeps per bed type, and notifies admissions via FIFO.
+ * Compile : gcc -Wall -Wextra -pthread -Iinclude <file> -lrt -lpthread
+ * ============================================================
  */
-
 #include "types.h"
 #include "ipc.h"
 #include <stdio.h>
@@ -32,20 +29,17 @@ int main(int argc, char *argv[]) {
     int bed_id = atoi(argv[3]);
     char *bed_type = argv[4];
 
-    // Step 1 - Print arrival message
-    // ICU = bold red, ISOLATION = bold yellow, GENERAL = bold cyan
-    char *color = "\033[0m"; // Default NC
+    char *color = "\033[0m"; 
     if (strcmp(bed_type, "ICU") == 0) {
-        color = "\033[1;31m"; // Bold Red
+        color = "\033[1;31m"; 
     } else if (strcmp(bed_type, "ISOLATION") == 0) {
-        color = "\033[1;33m"; // Bold Yellow
+        color = "\033[1;33m"; 
     } else if (strcmp(bed_type, "GENERAL") == 0) {
-        color = "\033[1;36m"; // Bold Cyan
+        color = "\033[1;36m"; 
     }
 
     printf("%s[PATIENT %d] Arrived at %s bed %d | Priority: %d\033[0m\n", color, patient_id, bed_type, bed_id, triage_level);
 
-    // Step 2 - Sleep random duration
     srand(getpid());
     int sleep_sec = 0;
     if (strcmp(bed_type, "ICU") == 0) {
@@ -63,21 +57,17 @@ int main(int argc, char *argv[]) {
     req.tv_nsec = 0;
     nanosleep(&req, NULL);
 
-    // Step 3 - Print treatment complete message
     printf("[PATIENT %d] Treatment complete. Discharging from bed %d.\n", patient_id, bed_id);
 
-    // Step 4 - Write patient_id as a string to named FIFO /tmp/discharge_fifo
     int fd = open_discharge_fifo_write();
     if (fd != -1) {
         char pid_str[32];
         snprintf(pid_str, sizeof(pid_str), "%d", patient_id);
-        // write the patient_id as a null-terminated string
         write(fd, pid_str, strlen(pid_str) + 1);
         close(fd);
     } else {
         fprintf(stderr, "[PATIENT %d] Warning: discharge FIFO not available.\n", patient_id);
     }
 
-    // Step 5 - Exit with code 0
     return 0;
 }

@@ -28,8 +28,8 @@ clean:
 	rm -f logs/*.txt
 	@echo "[CLEAN] Done."
 
-run:
-	bash scripts/start_hospital.sh
+run: all
+	./build/admissions --strategy best
 
 $(BUILD_DIR)/sched_test: $(SCHED_TEST_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -DSCHEDULER_TEST $^ -o $@ $(LDFLAGS)
@@ -39,8 +39,9 @@ test: $(BUILD_DIR)/sched_test
 	@echo "[TEST] Running scheduler self-test..."
 	@$(BUILD_DIR)/sched_test && echo "[TEST] Result: PASS" || echo "[TEST] Result: FAIL"
 
-valgrind:
-	valgrind --leak-check=full --track-origins=yes ./build/admissions
+valgrind: all
+	valgrind --leak-check=full --track-origins=yes --tool=memcheck \
+	         ./build/admissions --strategy best
 
 .PHONY: all clean run test valgrind
 

@@ -1,23 +1,19 @@
 #!/bin/bash
-# ==============================================================================
-# Project: Prime BedSpace
-# Script: triage.sh
-# Group: Zawiar & Subhani
-# Members: Abdul Ahad Zawiar (Abdu1-Ahd), AbdulRahim Subhani (abdulrahim-subh)
-# Date: 2026-05-08
-# Purpose: Validates patient triage inputs, assigns priority and care units,
-#          and outputs formatted data.
-# Usage: ./triage.sh <name> <age> <severity>
-# ==============================================================================
-
-# Output usage to stderr and exit
+# ============================================================
+# Project : Prime BedSpace - Hospital Patient Triage & Bed Allocator
+# Script  : triage.sh
+# Group   : Group 14
+# Members : Abdul Ahad (24F-0727), Abdul Rahim (24F-0514)
+# Date    : 2026-05-12
+# Purpose : Validates patient input, maps severity to triage priority, and pipes formatted patient record to admissions.
+# Usage   : bash scripts/triage.sh <name> <age> <severity 1-10>
+# ============================================================
 usage() {
     echo "Usage: $0 <name> <age> <severity>" >&2
     exit 1
 }
 
-# 1. Argument validation
-if [ "$#" -ne 3 ]; then
+if [ "$
     usage
 fi
 
@@ -25,22 +21,18 @@ NAME="$1"
 AGE="$2"
 SEVERITY="$3"
 
-# Validate name (non-empty)
 if [ -z "$NAME" ]; then
     usage
 fi
 
-# Validate age (integer 1-120)
 if ! [[ "$AGE" =~ ^[0-9]+$ ]] || [ "$AGE" -lt 1 ] || [ "$AGE" -gt 120 ]; then
     usage
 fi
 
-# Validate severity (integer 1-10)
 if ! [[ "$SEVERITY" =~ ^[0-9]+$ ]] || [ "$SEVERITY" -lt 1 ] || [ "$SEVERITY" -gt 10 ]; then
     usage
 fi
 
-# 2. Priority, Care Units, and Labels Mapping
 PRIORITY=0
 CARE_UNITS=0
 LABEL=""
@@ -49,7 +41,7 @@ COLOR=""
 RED_BOLD='\033[1;31m'
 YELLOW_BOLD='\033[1;33m'
 GREEN_BOLD='\033[1;32m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 if [ "$SEVERITY" -le 2 ]; then
     PRIORITY=1
@@ -78,12 +70,9 @@ else
     COLOR=$GREEN_BOLD
 fi
 
-# 3. Output logic
 PATIENT_ID=$$
 ARRIVAL_TIME=$(date +%s)
 
-# Print data to stdout
 echo "${PATIENT_ID}|${NAME}|${AGE}|${SEVERITY}|${PRIORITY}|${CARE_UNITS}|${ARRIVAL_TIME}"
 
-# Print formatted summary to stderr
 echo -e "${COLOR}[TRIAGE] ${NAME} | Age: ${AGE} | Severity: ${SEVERITY}/10 | Priority: ${PRIORITY} (${LABEL}) | Care Units: ${CARE_UNITS}${NC}" >&2

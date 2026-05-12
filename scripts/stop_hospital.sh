@@ -1,15 +1,13 @@
 #!/bin/bash
-# ==============================================================================
-# Project: Prime BedSpace
-# Script: stop_hospital.sh
-# Group: Zawiar & Subhani
-# Members: Abdul Ahad Zawiar (Abdu1-Ahd), AbdulRahim Subhani (abdulrahim-subh)
-# Date: 2026-05-08
-# Purpose: Safely terminates the hospital simulation and cleans up 
-#          IPC resources (FIFOs, PID files).
-# Usage: ./stop_hospital.sh
-# ==============================================================================
-
+# ============================================================
+# Project : Prime BedSpace - Hospital Patient Triage & Bed Allocator
+# Script  : stop_hospital.sh
+# Group   : Group 14
+# Members : Abdul Ahad (24F-0727), Abdul Rahim (24F-0514)
+# Date    : 2026-05-12
+# Purpose : Sends SIGTERM to admissions, cleans up FIFO and PID file, and prints shutdown summary.
+# Usage   : bash scripts/stop_hospital.sh
+# ============================================================
 if [ ! -f "/tmp/hospital.pid" ]; then
     echo "[ERROR] Hospital not running." >&2
     exit 1
@@ -28,7 +26,6 @@ if [ -p "/tmp/triage_fifo" ]; then
     rm -f /tmp/triage_fifo
 fi
 
-# Unlink named POSIX semaphores
 [ -e /dev/shm/sem.sem_icu_limit ]       && rm -f /dev/shm/sem.sem_icu_limit
 [ -e /dev/shm/sem.sem_isolation_limit ] && rm -f /dev/shm/sem.sem_isolation_limit
 

@@ -1,0 +1,15 @@
+# Ensure shell scripts always have LF line endings in the repo and checkout
+*.sh        text eol=lf
+
+# C source and headers — normalize to LF
+*.c         text eol=lf
+*.h         text eol=lf
+
+# Makefile must have LF
+Makefile    text eol=lf
+
+# Markdown / text — normalize
+*.md        text eol=lf
+
+# Binary files — no conversion
+*.dat       binary
