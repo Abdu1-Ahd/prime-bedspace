@@ -49,3 +49,5 @@ void ba_fragmentation_report(BedAllocator *a, FILE *log);
 const char *ba_strategy_name(AllocStrategy s);
 
 #endif 
+
+// session:b2ee3118b
