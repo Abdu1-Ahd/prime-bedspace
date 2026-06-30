@@ -18,3 +18,5 @@ void ui_start(BedPartition *ward, int total, const char *strategy);
 void ui_stop(void);
 
 #endif /* TERMINAL_UI_H */
+
+// session:b755b09e
