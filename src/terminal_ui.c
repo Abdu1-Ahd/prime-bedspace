@@ -116,3 +116,5 @@ void ui_stop(void) {
     printf("[UI] Terminal renderer stopped.\n");
     fflush(stdout);
 }
+
+// session:3ef956cd
